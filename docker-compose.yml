@@ -1,0 +1,60 @@
+# hikcloud2rtc: Hik-Connect NVR → локальный HTTP-сервис потока и снапшотов
+#
+# Сборка и запуск:
+#   cp .env.example .env          # вписать HIK_USER / HIK_PASSWORD
+#   docker compose up -d --build
+#
+# Сервис:
+#   hikcloud2rtc — python/FastAPI (:8000): логин в облако Hik-Connect,
+#                  VTM-воркеры расшифровки (cloudcam/decrypt_proxy, HEVC+H.264)
+#
+# Как смотреть (HOST = <host>):
+#   Поток (MPEG-TS, HEVC) — VLC «Открыть URL» / ffplay:
+#     http://HOST:8000/stream.ts?channel=8&stream=sub    # 640x360
+#     http://HOST:8000/stream.ts?channel=8&stream=main   # 1920x1080
+#   Снапшот — браузер / curl:
+#     http://HOST:8000/snapshot?channel=8                # из облака, ~352x288
+#     http://HOST:8000/frame?channel=8&stream=main       # FullHD-кадр из потока
+#
+# Нужен RTSP/HLS/WebRTC? Поднять отдельно контейнер go2rtc с источником
+#   ffmpeg:http://<host>:8000/stream.ts?channel=8&stream=sub#video=copy
+# (см. README.md).
+
+services:
+  hikcloud2rtc:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: hikcloud2rtc:latest
+    container_name: hikcloud2rtc
+    restart: unless-stopped
+    ports:
+      - "8000:8000"      # python API: /health /cameras /snapshot /frame /stream.ts /keys/*
+    environment:
+      # логин Hik-Connect (обязательно, через .env)
+      - HIK_USER=${HIK_USER:?set HIK_USER in .env}
+      - HIK_PASSWORD=${HIK_PASSWORD:?set HIK_PASSWORD in .env}
+      - PORT=8000
+      # данные (токены, cam-ключи) живут в volume (compose: hikcloud2rtc_data)
+      - DATA_DIR=/app/data
+      - TOKEN_FILE=/app/data/token.json
+      - CAM_KEYS_FILE=/app/data/cam_keys.json
+      - CLOUDCAM_TOKEN_FILE=/app/data/token.json
+      - CLOUDCAM_CAMKEY_FILE=/app/data/cam_keys.json
+      - CLOUDCAM_PLATFORM=hikconnect
+      # PacedWriter: сглаживать ли кадровые bursts облака (GOP приходит за раз,
+      # затем пауза ~2 с). 1 = кадры выдаются ровным потоком (плавная картинка,
+      # глубина буфера ~1 с), 0 = кадры уходят сразу при получении (минимальная
+      # задержка, но 2-с застытия и «перемотка» при GOP-передачах).
+      - PACE_FRAMES=${PACE_FRAMES:-1}
+    volumes:
+      - data:/app/data    # token.json + cam_keys.json переживают рестарт
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/health',timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+volumes:
+  data:
