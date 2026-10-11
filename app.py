@@ -402,8 +402,9 @@ def frame(channel: int = Query(DEFAULT_CHANNEL),
     """Full-resolution JPEG: decodes ONE frame from the live stream (main = 1080p).
 
     Unlike /snapshot (cloud API, fixed low resolution), the image is a real
-    decoded frame at the stream's native resolution. First keyframe may take
-    a few seconds (IRAP wait)."""
+    decoded frame at the stream's native resolution. We decode the first
+    INTRA (I) frame: a P-frame from mid-GOP has no reference in a fresh
+    decoder buffer and renders as a corrupted block of garbage."""
     if stream not in ("sub", "main"):
         stream = "main"
     try:
@@ -414,32 +415,39 @@ def frame(channel: int = Query(DEFAULT_CHANNEL),
     if not _wait_port(port, 8.0):
         raise HTTPException(502, f"stream worker (:{port}) did not start")
 
-    ts = Path(tempfile.mktemp(prefix="frame_", suffix=".ts"))
     out = Path(tempfile.mktemp(prefix="frame_", suffix=".jpg"))
     try:
-        # Capture ~5 s of the live stream (from its very start, so VPS/SPS/PPS
-        # + first IDR are included), then decode the first IDR from the file.
-        # Decoding the live pipe's first frame directly yields grey without
-        # the parameter sets that precede it.
-        gen = _stream_gen(port)
-        st = time.time()
-        with ts.open("wb") as f:
-            for chunk in gen:
-                f.write(chunk)
-                if time.time() - st >= 3.0:
-                    break
-        subprocess.run(
+        # Stream the live pipe straight into ffmpeg and pick the first
+        # I-frame (IDR). The worker is persistent, so a capture can start
+        # mid-GOP; decoding a P-frame there gives half-corrupted frames.
+        # The comma inside eq() must be quoted — it would otherwise be read
+        # as a filter-graph separator.
+        dec = subprocess.Popen(
             ["ffmpeg", "-hide_banner", "-loglevel", "error",
-             "-i", str(ts),
+             "-f", "mpegts", "-i", "pipe:0",
+             "-vf", "select='eq(pict_type,I)'",
              "-frames:v", "1", "-q:v", "2", "-f", "image2", str(out)],
-            timeout=max_wait)
+            stdin=subprocess.PIPE)
+        st = time.time()
+        try:
+            for chunk in _stream_gen(port):
+                try:
+                    dec.stdin.write(chunk)
+                except (BrokenPipeError, ConnectionResetError):
+                    break  # ffmpeg found the I-frame and closed stdin
+                if time.time() - st >= max_wait:
+                    break
+        finally:
+            dec.stdin.close()
+            if dec.poll() is None:
+                dec.kill()  # timeout or capture aborted — don't leak ffmpeg
+                dec.wait(timeout=max_wait)
         if not out.exists() or not out.stat().st_size:
-            raise HTTPException(504, "no IDR frame in 3 s of stream")
+            raise HTTPException(504, "no keyframe (I-frame) in stream window")
         jpeg = out.read_bytes()
     except subprocess.TimeoutExpired:
         raise HTTPException(504, "decode timeout")
     finally:
-        ts.unlink(missing_ok=True)
         out.unlink(missing_ok=True)
     log.info("frame %s ch=%d %s -> %d bytes", s, ch, stream, len(jpeg))
     return Response(jpeg, media_type="image/jpeg")
