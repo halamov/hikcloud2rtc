@@ -115,20 +115,40 @@ def health():
 
 # ---------------- camera list ----------------
 
-_cam_cache: tuple[float, list] | None = None
+_CAM_LIST_TTL = 600.0
+_CAM_LIST_TTL_EMPTY = 15.0   # пустой список — кэшируем коротко (облако может
+                             # отваливаться временно, "Rpc invoke exception")
+
+_cam_cache: tuple[float, list, float] | None = None
 
 
 def _cameras(force: bool = False) -> list:
-    """[(serial, channel, label)] — active VTM channels only."""
+    """[(serial, channel, label)] — active VTM channels only.
+
+    Облако Hik-Connect периодически отвечает на VTM pagelist ошибкой
+    (meta.code 504 "Rpc invoke exception") — это временный сбой релея,
+    не признак «камер нет». Поэтому пустой список ретраим и кэшируем
+    с коротким TTL, чтобы /stream и /frame не ложились на «no active
+    cameras in cloud» на 10 минут."""
     global _cam_cache
     now = time.time()
-    if not force and _cam_cache and now - _cam_cache[0] < _CAM_LIST_TTL:
+    if not force and _cam_cache and now - _cam_cache[0] < _cam_cache[2]:
         return _cam_cache[1]
     _cc()                       # ensure token file exists & fresh
     client = dp._make_client()
     cams = dp.list_cameras(client)
-    _cam_cache = (now, cams)
-    log.info("camera list: %d active channels", len(cams))
+    if not cams:
+        for _attempt in range(3):
+            time.sleep(2)
+            try:
+                cams = dp.list_cameras(client)
+            except Exception:  # noqa: BLE001
+                pass
+            if cams:
+                break
+    ttl = _CAM_LIST_TTL if cams else _CAM_LIST_TTL_EMPTY
+    _cam_cache = (now, cams, ttl)
+    log.info("camera list: %d active channels (ttl %.0fs)", len(cams), ttl)
     return cams
 
 

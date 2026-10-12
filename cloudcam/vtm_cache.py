@@ -55,6 +55,20 @@ def _path(key: str, kind: str) -> str:
     return os.path.join(cache_dir(), f"vtm-{safe}-{kind}.json")
 
 
+def _is_error(data: Any) -> bool:
+    """Ответ облака с ошибкой (meta.code != 200).
+
+    Такие ответы НЕ кешируем: облако периодически отваливается
+    (504 «Rpc invoke exception»), и закэшированная ошибка затем
+    подменяет живой ответ на весь TTL."""
+    if not isinstance(data, dict):
+        return False
+    meta = data.get("meta")
+    if isinstance(meta, dict) and meta.get("code"):
+        return meta.get("code") != 200
+    return False
+
+
 def load(key: str, kind: str) -> Any | None:
     """Значение, если кеш свежий, иначе None."""
     try:
@@ -168,17 +182,25 @@ def install(token_file: str | None = None) -> str:
     def _cached_pagelist(client):
         hit = load(key, "pagelist")
         if hit is not None:
-            return hit
+            if _is_error(hit):
+                hit = None        # в кеше застыла ошибка облака — переспрашиваем
+            else:
+                return hit
         data = inner_pagelist(client)
-        store(key, "pagelist", data)
+        if not _is_error(data):   # ошибки облака в кеш не пишем
+            store(key, "pagelist", data)
         return data
 
     def _cached_vtdu(client, *a, **kw):
         hit = load(key, "vtdu")
         if hit is not None:
-            return hit
+            if _is_error(hit):
+                hit = None
+            else:
+                return hit
         data = inner_vtdu(client, *a, **kw)
-        store(key, "vtdu", data)
+        if not _is_error(data):
+            store(key, "vtdu", data)
         return data
 
     _cs.get_vtm_page_list = _cached_pagelist
