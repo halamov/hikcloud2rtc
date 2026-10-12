@@ -427,7 +427,7 @@ def frame(channel: int = Query(DEFAULT_CHANNEL),
              "-f", "mpegts", "-i", "pipe:0",
              "-vf", "select='eq(pict_type,I)'",
              "-frames:v", "1", "-q:v", "2", "-f", "image2", str(out)],
-            stdin=subprocess.PIPE)
+            stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
         st = time.time()
         try:
             for chunk in _stream_gen(port):
@@ -438,10 +438,19 @@ def frame(channel: int = Query(DEFAULT_CHANNEL),
                 if time.time() - st >= max_wait:
                     break
         finally:
-            dec.stdin.close()
+            try:
+                dec.stdin.close()
+            except (BrokenPipeError, OSError):
+                pass  # ffmpeg already exited after the I-frame
             if dec.poll() is None:
-                dec.kill()  # timeout or capture aborted — don't leak ffmpeg
-                dec.wait(timeout=max_wait)
+                try:
+                    dec.kill()  # timeout or capture aborted — don't leak ffmpeg
+                except ProcessLookupError:
+                    pass
+                try:
+                    dec.wait(timeout=max_wait)
+                except subprocess.TimeoutExpired:
+                    pass
         if not out.exists() or not out.stat().st_size:
             raise HTTPException(504, "no keyframe (I-frame) in stream window")
         jpeg = out.read_bytes()
