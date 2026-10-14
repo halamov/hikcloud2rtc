@@ -292,10 +292,35 @@ def _wait_port(port: int, timeout: float = 8.0) -> bool:
     return False
 
 
-def _worker_stream(port: int) -> Iterator[bytes]:
+def _worker_open(port: int, retries: int = 3, pause: float = 3.0):
+    """Открыть HTTP-поток воркера, с ретраями на временные сбои облака.
+
+    Воркер отвечает 502, когда VTM-сессия не открылась: релея облака
+    периодически отваливается (504 «Rpc invoke exception») на десятки секунд,
+    устройство уходит в оффлайн и т.п. Без ретраев короткий сбой облака
+    превращался в ошибку для клиента; теперь переспрашиваем несколько раз
+    (каждый запрос к воркеру — новая попытка открыть VTM) и лишь затем
+    отдаём честную 502, а не 500."""
+    last = None
+    for attempt in range(1, retries + 1):
+        req = urllib.request.Request("http://127.0.0.1:%d/" % port)
+        try:
+            return urllib.request.urlopen(req, timeout=40)
+        except urllib.error.HTTPError as e:
+            last = e
+            log.warning("worker :%d http %s (attempt %d/%d)",
+                        port, e.code, attempt, retries)
+        except (OSError, urllib.error.URLError) as e:
+            last = e
+            log.warning("worker :%d unreachable: %s (attempt %d/%d)",
+                        port, e, attempt, retries)
+        time.sleep(pause)
+    raise HTTPException(502,
+                        "stream worker (:%d) failed to open stream: %s" % (port, last))
+
+
+def _worker_stream(r) -> Iterator[bytes]:
     """Worker bytes as soon as they arrive (read1 — no full-buffer waits)."""
-    req = urllib.request.Request("http://127.0.0.1:%d/" % port)
-    r = urllib.request.urlopen(req, timeout=40)
     try:
         while True:
             b = r.read1(65536)
@@ -352,13 +377,13 @@ def _ts_remux(annexb: Iterator[bytes], codec_guess: str) -> Iterator[bytes]:
             p.kill()
 
 
-def _stream_gen(port: int) -> Iterator[bytes]:
+def _stream_gen(r, port: int = 0) -> Iterator[bytes]:
     """Detect format from the FIRST chunk (~100 ms) and stream immediately.
 
     No large pre-buffer: go2rtc pulls ffmpeg with `-fflags nobuffer` and aborts
     ("Immediate exit") if the first TS packet is held back for seconds.
     """
-    raw = _worker_stream(port)
+    raw = _worker_stream(r)
     try:
         head = next(raw)
     except StopIteration:
@@ -410,7 +435,8 @@ def stream_ts(channel: int = Query(DEFAULT_CHANNEL),
     port = _ensure_worker(s, ch, stream)
     if not _wait_port(port, 8.0):
         raise HTTPException(502, f"stream worker (:{port}) did not start")
-    return StreamingResponse(_stream_gen(port), media_type="video/mp2t",
+    r = _worker_open(port)  # ретраи на временный сбой VTM-облака (502 воркера)
+    return StreamingResponse(_stream_gen(r, port), media_type="video/mp2t",
                              headers={"Cache-Control": "no-store"})
 
 
@@ -436,44 +462,51 @@ def frame(channel: int = Query(DEFAULT_CHANNEL),
         raise HTTPException(502, f"stream worker (:{port}) did not start")
 
     out = Path(tempfile.mktemp(prefix="frame_", suffix=".jpg"))
+    # Сбой VTM-облака (502 воркера) или обрыв потока до первого I-кадра —
+    # частый случай: повторяем «открыть + дождаться I-кадра» пару раз.
     try:
-        # Stream the live pipe straight into ffmpeg and pick the first
-        # I-frame (IDR). The worker is persistent, so a capture can start
-        # mid-GOP; decoding a P-frame there gives half-corrupted frames.
-        # The comma inside eq() must be quoted — it would otherwise be read
-        # as a filter-graph separator.
-        dec = subprocess.Popen(
-            ["ffmpeg", "-hide_banner", "-loglevel", "error",
-             "-f", "mpegts", "-i", "pipe:0",
-             "-vf", "select='eq(pict_type,I)'",
-             "-frames:v", "1", "-q:v", "2", "-f", "image2", str(out)],
-            stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
-        st = time.time()
-        try:
-            for chunk in _stream_gen(port):
-                try:
-                    dec.stdin.write(chunk)
-                except (BrokenPipeError, ConnectionResetError):
-                    break  # ffmpeg found the I-frame and closed stdin
-                if time.time() - st >= max_wait:
-                    break
-        finally:
+        for attempt in (1, 2):
+            r = _worker_open(port)  # ретраи на временный сбой VTM-облака
+            # Stream the live pipe straight into ffmpeg and pick the first
+            # I-frame (IDR). The worker is persistent, so a capture can start
+            # mid-GOP; decoding a P-frame there gives half-corrupted frames.
+            # The comma inside eq() must be quoted — it would otherwise be
+            # read as a filter-graph separator.
+            dec = subprocess.Popen(
+                ["ffmpeg", "-hide_banner", "-loglevel", "error",
+                 "-f", "mpegts", "-i", "pipe:0",
+                 "-vf", "select='eq(pict_type,I)'",
+                 "-frames:v", "1", "-q:v", "2", "-f", "image2", str(out)],
+                stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            st = time.time()
             try:
-                dec.stdin.close()
-            except (BrokenPipeError, OSError):
-                pass  # ffmpeg already exited after the I-frame
-            if dec.poll() is None:
+                for chunk in _stream_gen(r, port):
+                    try:
+                        dec.stdin.write(chunk)
+                    except (BrokenPipeError, ConnectionResetError):
+                        break  # ffmpeg found the I-frame and closed stdin
+                    if time.time() - st >= max_wait:
+                        break
+            finally:
                 try:
-                    dec.kill()  # timeout or capture aborted — don't leak ffmpeg
-                except ProcessLookupError:
-                    pass
-                try:
-                    dec.wait(timeout=max_wait)
-                except subprocess.TimeoutExpired:
-                    pass
-        if not out.exists() or not out.stat().st_size:
-            raise HTTPException(504, "no keyframe (I-frame) in stream window")
-        jpeg = out.read_bytes()
+                    dec.stdin.close()
+                except (BrokenPipeError, OSError):
+                    pass  # ffmpeg already exited after the I-frame
+                if dec.poll() is None:
+                    try:
+                        dec.kill()  # timeout or capture aborted — don't leak ffmpeg
+                    except ProcessLookupError:
+                        pass
+                    try:
+                        dec.wait(timeout=max_wait)
+                    except subprocess.TimeoutExpired:
+                        pass
+            if out.exists() and out.stat().st_size:
+                jpeg = out.read_bytes()
+                break
+            if attempt == 2:
+                raise HTTPException(504, "no keyframe (I-frame) in stream window")
+            time.sleep(3.0)  # облако может восстановиться — повторяем
     except subprocess.TimeoutExpired:
         raise HTTPException(504, "decode timeout")
     finally:
