@@ -24,10 +24,11 @@ Env:
 """
 from __future__ import annotations
 
+import asyncio
 import json
-import itertools
 import logging
 import os
+import queue
 import socket
 import subprocess
 import sys
@@ -39,7 +40,7 @@ import urllib.request
 from pathlib import Path
 from typing import Iterator
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import Response, StreamingResponse
 
 DATA_DIR = os.environ.get("DATA_DIR", "/app/data")
@@ -109,8 +110,30 @@ def health():
         "stream_fullhd": f"/stream.ts?channel={DEFAULT_CHANNEL}&stream=main",
         "snapshot": f"/snapshot?channel={DEFAULT_CHANNEL}",
         "frame_fullhd": f"/frame?channel={DEFAULT_CHANNEL}&stream=main",
+        "prime": f"/prime?channel={DEFAULT_CHANNEL}&stream=main",
+        "worker_mode": WORKER_MODE,
+        "workers_active": len([w for w in _workers.values() if w["proc"].poll() is None]),
         "rtsp": "rtsp://<host>:8554/cam%d (sub) / cam%d_main (FullHD) via go2rtc" % (DEFAULT_CHANNEL, DEFAULT_CHANNEL),
     }
+
+
+@app.get("/workers")
+def workers_debug():
+    """Диагностика воркеров: активные клиенты и время простоя (для idle-timeout)."""
+    now = time.time()
+    out = []
+    with _workers_lock:
+        for key, w in _workers.items():
+            out.append({
+                "key": "%s ch=%d %s" % key,
+                "alive": w["proc"].poll() is None,
+                "active": w.get("active", 0),
+                "reads": w.get("reads", 0),
+                "idle_s": round(now - w["last_use"], 1),
+                "timeout_s": WORKER_IDLE_TIMEOUT,
+                "port": w["port"],
+            })
+    return {"mode": WORKER_MODE, "workers": out}
 
 
 # ---------------- camera list ----------------
@@ -238,6 +261,14 @@ def _restart_worker(serial: str, channel: int) -> None:
 
 # ---------------- stream workers ----------------
 
+# WORKER_MODE: always = воркеры живут 24/7 (тёплый поток, трафик с облака
+# постоянный); idle = воркер убивается через WORKER_IDLE_TIMEOUT секунд без
+# клиентов — трафик только во время опросов (сценарий «звонок в домофон»).
+WORKER_MODE = os.environ.get("WORKER_MODE", "always").strip().lower()
+if WORKER_MODE not in ("always", "idle"):
+    WORKER_MODE = "always"
+WORKER_IDLE_TIMEOUT = float(os.environ.get("WORKER_IDLE_TIMEOUT", "90"))
+
 _workers: dict[tuple, dict] = {}
 _workers_lock = threading.RLock()
 _next_port = {"i": 0}
@@ -262,6 +293,7 @@ def _ensure_worker(serial: str, channel: int, mode: str) -> int:
     with _workers_lock:
         w = _workers.get(key)
         if w and w["proc"].poll() is None:
+            w["last_use"] = time.time()
             return w["port"]
         port = _worker_port()
         env = dict(os.environ,
@@ -280,9 +312,67 @@ def _ensure_worker(serial: str, channel: int, mode: str) -> int:
                 stderr=open(f"/tmp/worker_{serial}_{channel}_{mode}.log", "ab", buffering=0))
         except Exception as e:  # noqa: BLE001
             raise HTTPException(502, f"worker start failed: {e}") from e
-        _workers[key] = {"proc": proc, "port": port}
+        _workers[key] = {"proc": proc, "port": port,
+                         "last_use": time.time(), "active": 0}
         log.info("worker %s ch=%d %s -> :%d (pid %d)", serial, channel, mode, port, proc.pid)
         return port
+
+
+def _worker_touch(port: int) -> None:
+    """Клиент подключился к воркеру: отметим активность (для idle-timeout)."""
+    with _workers_lock:
+        for w in _workers.values():
+            if w["port"] == port and w["proc"].poll() is None:
+                w["last_use"] = time.time()
+                w["active"] += 1
+                return
+
+
+def _worker_untouch(port: int) -> None:
+    with _workers_lock:
+        for w in _workers.values():
+            if w["port"] == port and w["proc"].poll() is None:
+                w["active"] = max(0, w["active"] - 1)
+                w["last_use"] = time.time()
+                return
+
+
+def _reap_idle_workers() -> None:
+    """WORKER_MODE=idle: убиваем воркеры без клиентов дольше WORKER_IDLE_TIMEOUT.
+
+    Трафик с облака тогда идёт только вокруг опросов (звонок в домофон →
+    /prime → /frame → через 90 с тишины воркер и VTM-сессия закрываются).
+    """
+    if WORKER_MODE != "idle":
+        return
+    now = time.time()
+    with _workers_lock:
+        for key, w in list(_workers.items()):
+            alive = w["proc"].poll() is None
+            age = now - w["last_use"]
+            # диагностика: логим состояние каждого воркера, пока режим idle
+            log.debug("reaper: worker %s alive=%s active=%d idle=%.0fs (timeout %.0fs)",
+                      key, alive, w.get("active", 0), age, WORKER_IDLE_TIMEOUT)
+            if alive and w.get("active", 0) == 0 and age > WORKER_IDLE_TIMEOUT:
+                log.info("worker %s idle %.0fs — stop", key, age)
+                try:
+                    w["proc"].kill()
+                except ProcessLookupError:
+                    pass
+                del _workers[key]
+
+
+def _reaper_loop() -> None:
+    while True:
+        time.sleep(15)
+        try:
+            _reap_idle_workers()
+        except Exception as e:  # noqa: BLE001
+            log.warning("reaper: %s", e)
+
+
+threading.Thread(target=_reaper_loop, daemon=True, name="worker-reaper").start()
+log.info("worker mode: %s (idle timeout %.0fs)", WORKER_MODE, WORKER_IDLE_TIMEOUT)
 
 
 def _wait_port(port: int, timeout: float = 8.0) -> bool:
@@ -309,7 +399,9 @@ def _worker_open(port: int, retries: int = 3, pause: float = 3.0):
     for attempt in range(1, retries + 1):
         req = urllib.request.Request("http://127.0.0.1:%d/" % port)
         try:
-            return urllib.request.urlopen(req, timeout=40)
+            r = urllib.request.urlopen(req, timeout=40)
+            _worker_touch(port)
+            return r
         except urllib.error.HTTPError as e:
             last = e
             log.warning("worker :%d http %s (attempt %d/%d)",
@@ -323,13 +415,19 @@ def _worker_open(port: int, retries: int = 3, pause: float = 3.0):
                         "stream worker (:%d) failed to open stream: %s" % (port, last))
 
 
-def _worker_stream(r) -> Iterator[bytes]:
+def _worker_stream(r, port: int = 0) -> Iterator[bytes]:
     """Worker bytes as soon as they arrive (read1 — no full-buffer waits)."""
     try:
         while True:
             b = r.read1(65536)
             if not b:
                 break
+            if port:
+                with _workers_lock:
+                    for w in _workers.values():
+                        if w["port"] == port:
+                            w["reads"] = w.get("reads", 0) + 1
+                            break
             yield b
     except Exception as e:  # noqa: BLE001
         log.info("worker stream ended: %s", e)
@@ -338,10 +436,22 @@ def _worker_stream(r) -> Iterator[bytes]:
             r.close()
         except Exception:
             pass
+        if port:
+            _worker_untouch(port)
 
 
-def _ts_remux(annexb: Iterator[bytes], codec_guess: str) -> Iterator[bytes]:
-    """Annex-B -> MPEG-TS (go2rtc `ffmpeg:` source wants TS)."""
+def _ts_remux(source, codec_guess: str) -> Iterator[bytes]:
+    """Annex-B -> MPEG-TS (go2rtc `ffmpeg:` source wants TS).
+
+    source = (head: bytes, raw: iterator). The remux feeds ffmpeg from a
+    background thread (avoids stdin/stdout pipe deadlock) while this generator
+    yields remuxed TS to the client. The feed thread OWNS the source's cleanup:
+    when ffmpeg dies (client disconnect) the feed breaks and closes `raw`,
+    which runs _worker_stream's finally (r.close + _worker_untouch). Without
+    that close the active-client counter leaks and WORKER_MODE=idle never
+    reaps the worker.
+    """
+    head, raw = source
     p = subprocess.Popen(
         ["ffmpeg", "-hide_banner", "-loglevel", "error",
          # low-latency: default input probe (analyzeduration 5 s / probesize
@@ -355,14 +465,23 @@ def _ts_remux(annexb: Iterator[bytes], codec_guess: str) -> Iterator[bytes]:
 
     def _feed():
         try:
-            for chunk in annexb:
-                if p.poll() is None:
-                    p.stdin.write(chunk)
+            p.stdin.write(head)
+            for chunk in raw:
+                # ffmpeg мёртв (клиент отвалился) — не читаем источник вечно
+                if p.poll() is not None:
+                    break
+                p.stdin.write(chunk)
         except Exception:
             pass
         finally:
             try:
                 p.stdin.close()
+            except Exception:
+                pass
+            # закрываем источник: доходит _worker_stream finally →
+            # r.close() + _worker_untouch (иначе idle-timeout не сработает)
+            try:
+                raw.close()
             except Exception:
                 pass
 
@@ -387,7 +506,7 @@ def _stream_gen(r, port: int = 0) -> Iterator[bytes]:
     No large pre-buffer: go2rtc pulls ffmpeg with `-fflags nobuffer` and aborts
     ("Immediate exit") if the first TS packet is held back for seconds.
     """
-    raw = _worker_stream(r)
+    raw = _worker_stream(r, port)
     try:
         head = next(raw)
     except StopIteration:
@@ -405,7 +524,7 @@ def _stream_gen(r, port: int = 0) -> Iterator[bytes]:
     codec = _detect_annexb_codec(head)
     log.info("worker :%d emits Annex-B (%s) -> remux MPEG-TS (first chunk %dB)",
              port, codec, len(head))
-    yield from _ts_remux(itertools.chain([head], raw), codec)
+    yield from _ts_remux((head, raw), codec)
 
 
 def _detect_annexb_codec(head: bytes) -> str:
@@ -427,9 +546,10 @@ def _detect_annexb_codec(head: bytes) -> str:
 
 
 @app.get("/stream.ts")
-def stream_ts(channel: int = Query(DEFAULT_CHANNEL),
-              serial: str = Query(""),
-              stream: str = Query(DEFAULT_STREAM)):
+async def stream_ts(request: Request,
+                    channel: int = Query(DEFAULT_CHANNEL),
+                    serial: str = Query(""),
+                    stream: str = Query(DEFAULT_STREAM)):
     if stream not in ("sub", "main", "auto"):
         stream = "sub"
     try:
@@ -440,8 +560,102 @@ def stream_ts(channel: int = Query(DEFAULT_CHANNEL),
     if not _wait_port(port, 8.0):
         raise HTTPException(502, f"stream worker (:{port}) did not start")
     r = _worker_open(port)  # ретраи на временный сбой VTM-облака (502 воркера)
-    return StreamingResponse(_stream_gen(r, port), media_type="video/mp2t",
+
+    q: "queue.Queue" = queue.Queue()
+
+    def _pump():
+        # Один владелец генератора: перебираем его в этом трее и кладём
+        # чанки в очередь. finally (gen.close()) — детерминированная точка
+        # очистки: _ts_remux finally (убийство ffmpeg) + raw.close() →
+        # _worker_stream finally (r.close + _worker_untouch).
+        gen = _stream_gen(r, port)
+        try:
+            for chunk in gen:
+                q.put(chunk)
+        except Exception as e:  # noqa: BLE001
+            log.info("stream.ts pump ended: %s", e)
+        finally:
+            try:
+                gen.close()
+            except Exception:
+                pass
+            q.put(None)  # EOF-маркер для async-покупателя
+
+    pump = threading.Thread(target=_pump, daemon=True, name="stream-pump")
+    pump.start()
+
+    async def _agen():
+        try:
+            while True:
+                if await request.is_disconnected():
+                    log.info("stream.ts client disconnected (:%d)", port)
+                    return
+                try:
+                    item = await asyncio.wait_for(
+                        asyncio.get_running_loop().run_in_executor(
+                            None, q.get), 2.0)
+                except asyncio.TimeoutError:
+                    continue  # пауза в потоке (между GOP) — проверяем disconnect
+                if item is None:
+                    return
+                yield item
+        finally:
+            # Клиент ушёл (или поток закончился): закрываем генератор.
+            # gen.close() из async-контекста не безопасно, но мы НЕ
+            # перебираем его параллельно: pump уже остановился (EOF) либо
+            # блокируется на read — close() из другого треда для генератора
+            # в состоянии suspended-safe только через GC. Поэтому здесь
+            # закрываем то, что принадлежит НАМ: pump-тред сам завершит
+            # gen.close() в своём finally, когда заметит закрытый r /
+            # умерший ffmpeg. Для надёжности в случае зависшего pump —
+            # принудительный r.close() (read1 упадёт → pump выйдет →
+            # его finally закроет gen и сотрёт active-счётчик).
+            try:
+                r.close()
+            except Exception:
+                pass
+            pump.join(timeout=3.0)
+
+    return StreamingResponse(_agen(), media_type="video/mp2t",
                              headers={"Cache-Control": "no-store"})
+
+
+@app.get("/prime")
+def prime(channel: int = Query(DEFAULT_CHANNEL),
+          serial: str = Query(""),
+          stream: str = Query("main")):
+    """Прогрев воркера по триггеру (звонок в домофон).
+
+    Запускает воркер и ждёт, пока фоновая VTM-сессия начнёт давать данные,
+    затем закрывает соединение — сессия в воркере остаётся ТЕПЛОЙ, и
+    следующий /frame отвечает за ~4 с (GOP), а не 6–8 с холодного старта.
+    В WORKER_MODE=always это избыточно (воркер и так живёт 24/7), в idle —
+    вот он и есть «разбуживание».
+
+    GET /prime?channel=8&stream=main  →  {"warm": true, "waited_s": 2.4}
+    """
+    if stream not in ("sub", "main"):
+        stream = "main"
+    try:
+        s, ch, _label = _resolve(channel, serial or None)
+    except HTTPException:
+        raise
+    t0 = time.time()
+    port = _ensure_worker(s, ch, stream)
+    if not _wait_port(port, 8.0):
+        raise HTTPException(502, f"stream worker (:{port}) did not start")
+    # Ответ 200 от воркера = сессия уже отдаёт данные (см. decrypt_proxy do_GET)
+    try:
+        r = _worker_open(port)
+    except HTTPException:
+        raise
+    _worker_untouch(port)
+    try:
+        r.close()
+    except Exception:
+        pass
+    return {"warm": True, "waited_s": round(time.time() - t0, 2),
+            "worker_mode": WORKER_MODE}
 
 
 @app.get("/frame")
@@ -483,8 +697,9 @@ def frame(channel: int = Query(DEFAULT_CHANNEL),
                  "-frames:v", "1", "-q:v", "2", "-f", "image2", str(out)],
                 stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
             st = time.time()
+            gen = _stream_gen(r, port)
             try:
-                for chunk in _stream_gen(r, port):
+                for chunk in gen:
                     try:
                         dec.stdin.write(chunk)
                     except (BrokenPipeError, ConnectionResetError):
@@ -492,6 +707,14 @@ def frame(channel: int = Query(DEFAULT_CHANNEL),
                     if time.time() - st >= max_wait:
                         break
             finally:
+                # gen.close() детерминированно доводит генератор до finally
+                # (_worker_stream → _worker_untouch): иначе break из for-цикла
+                # оставил бы счётчик активных клиентов >0 навсегда и
+                # idle-timeout в WORKER_MODE=idle бы не сработал.
+                try:
+                    gen.close()
+                except Exception:
+                    pass
                 try:
                     dec.stdin.close()
                 except (BrokenPipeError, OSError):
