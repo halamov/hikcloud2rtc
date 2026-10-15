@@ -68,6 +68,7 @@ curl -o cam8_hd.jpg "http://<host>:8000/frame?channel=8&stream=main"
 | `GET /snapshot?channel=N` | JPEG из облака (~352×288) |
 | `GET /frame?channel=N&stream=main` | FullHD JPEG из потока (1920×1080) |
 | `GET /prime?channel=N&stream=main` | прогреть воркер заранее (тёплый старт) |
+| `GET /workers` | диагностика: воркеры, активные клиенты, простой (idle-timeout) |
 
 Другая камера — меняется `channel=`.
 
