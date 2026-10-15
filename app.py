@@ -269,10 +269,14 @@ def _ensure_worker(serial: str, channel: int, mode: str) -> int:
                    CLOUDCAM_CAM_KEY=_cam_key(serial, channel))
         cmd = [sys.executable, "-m", "cloudcam.decrypt_proxy",
                serial, str(port), "-", str(channel), f"--stream={mode}"]
+        # stdin=PIPE + CLOUDCAM_PARENT_WATCH=1: если процесс сервиса умрёт
+        # (не перезапустив контейнер), воркер закроется вместе с ним и не
+        # оставит сирот, державших порты и VTM-сессии ([[watch_parent]]).
+        env["CLOUDCAM_PARENT_WATCH"] = "1"
         try:
             proc = subprocess.Popen(
                 cmd, cwd=os.path.dirname(os.path.abspath(__file__)), env=env,
-                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
                 stderr=open(f"/tmp/worker_{serial}_{channel}_{mode}.log", "ab", buffering=0))
         except Exception as e:  # noqa: BLE001
             raise HTTPException(502, f"worker start failed: {e}") from e

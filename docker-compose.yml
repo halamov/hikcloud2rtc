@@ -41,6 +41,9 @@ services:
       - CAM_KEYS_FILE=/app/data/cam_keys.json
       - CLOUDCAM_TOKEN_FILE=/app/data/token.json
       - CLOUDCAM_CAMKEY_FILE=/app/data/cam_keys.json
+      # PacedWriter: очередь 2 МБ вместо 8 (у нас один зритель, не grid-23);
+      # 1/4 МБ — если захотеть ещё меньше задержки
+      - PACE_QUEUE_MB=2
       - CLOUDCAM_PLATFORM=hikconnect
       # PacedWriter: сглаживать ли кадровые bursts облака (GOP приходит за раз,
       # затем пауза ~2 с). 1 = кадры выдаются ровным потоком (плавная картинка,

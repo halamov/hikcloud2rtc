@@ -18,6 +18,8 @@
 
 import hashlib
 import json
+import os
+import tempfile
 import time
 
 import requests
@@ -405,18 +407,34 @@ class CloudClient:
     def save_token(self, path="ezviz_token.json"):
         """Сохраняет сессию на диск — при следующем запуске login НЕ будет.
 
+        Атомарная запись (mkstemp + os.replace): если процесс упадёт в середине
+        записи, на диске останется либо старый, либо новый файл — а не обрезанный.
+        Битый token.json при старте привёл бы к полному login (CAPTCHA/2FA).
+
         Также пишется `feature_code`: если token перенесён на другой компьютер,
         [[load_token]] отклонит его (облако всё равно не примет)."""
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump({
-                "session_id": self.session_id,
-                "rf_session_id": self.rf_session_id,
-                "username": self.email,
-                "api_url": self.api_url,
-                "platform": self.platform,
-                "feature_code": self.FEATURE_CODE,
-                # Записывается реальный возраст: если неизвестно (0) — `connect()`
-                # обновит. Если поставить `time.time()`, сессия будет «свежей»
-                # и использовалась бы в протухшем состоянии.
-                "session_time": self.session_time,
-            }, f)
+        payload = {
+            "session_id": self.session_id,
+            "rf_session_id": self.rf_session_id,
+            "username": self.email,
+            "api_url": self.api_url,
+            "platform": self.platform,
+            "feature_code": self.FEATURE_CODE,
+            # Записывается реальный возраст: если неизвестно (0) — `connect()`
+            # обновит. Если поставить `time.time()`, сессия будет «свежей»
+            # и использовалась бы в протухшем состоянии.
+            "session_time": self.session_time,
+        }
+        d = os.path.dirname(os.path.abspath(path))
+        os.makedirs(d, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=d, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(payload, f)
+            os.replace(tmp, path)
+        except OSError:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            raise

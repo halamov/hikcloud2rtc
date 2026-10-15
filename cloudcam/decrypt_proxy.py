@@ -813,7 +813,14 @@ class PacedWriter:
        (без обрыва посередине), а облачный reader никогда не ждёт.
     """
 
-    MAX_BYTES = 8 << 20        # лимит очереди (сжатые байты)
+    MAX_BYTES = 8 << 20        # лимит очереди (сжатые байты); через PACE_QUEUE_MB
+    # для сервисного использования (один зритель, а не grid из 23 плиток)
+    # достаточно 1–2 МБ — глубина буфера TARGET_S уже ограничивает задержку.
+    if os.environ.get("PACE_QUEUE_MB"):
+        try:
+            MAX_BYTES = int(int(float(os.environ["PACE_QUEUE_MB"]) * 1024 * 1024))
+        except ValueError:
+            pass
     TARGET_S = 1.0             # целевая глубина буфера
     RATE_WINDOW_S = 4.0        # скорость прихода измеряется в этом окне
     MIN_STEP, MAX_STEP = 1 / 60.0, 1 / 4.0
@@ -1075,6 +1082,114 @@ def list_cameras(client=None):
 
 STREAM_PROBE_TIMEOUT = 6.0     # в режиме "auto" substream ожидается именно столько
 PACE_FRAMES = os.environ.get("PACE_FRAMES", "1") not in ("0", "false", "off", "")
+# Размер кольца _StreamSession: хвост от последнего keyframe. 1.5 МБ — ~1–2 GOP
+# (GOP main ~0.2 МБ). Больше — больше "готовность", меньше — меньше память.
+_RING_MAX_BYTES = int(1.5 * 1024 * 1024)
+
+
+def _prime_packets(pkts):
+    """Читает начальные пакеты, чтобы определить формат (RTP/PS/TS) и codec
+    (H.264/HEVC). Пакеты возвращаются вызывающему — они ещё пригодятся."""
+    buffered, is_rtp, codec = [], None, None
+    for pkt in pkts:
+        b = bytes(pkt.body)
+        buffered.append(b)
+        if is_rtp is None:
+            is_rtp = len(b) >= 1 and (b[0] >> 6) == 2
+        if not is_rtp:
+            break  # MPEG-PS или TS
+        if (b[1] & 0x7F) == HEVC_VIDEO_PT:
+            pl = rtp_payload(b)
+            if len(pl) >= 1:
+                codec = detect_rtp_codec(pl[0])
+                if codec:
+                    break
+        # сканируем до keyframe/однозначного маркера (для длинного GOP)
+        if len(buffered) >= 400:
+            break
+    return buffered, is_rtp, codec
+
+
+class _StreamSession:
+    """Общая фоновая VTM-сессия на канал (одна на воркер, не на запрос).
+
+    Читатель-тред ([[serve]]: `_reader`) держит облачный поток открытым
+    постоянно и дописывает в ЛОГ уже преобразованные (расшифрованные)
+    данные. Лог — это и есть КОЛЬЦО: окно от последнего KEYFRAME (Annex-B)
+    или байтовое окно (TS). Клиент в любой момент: снимает снимок лога
+    (готовый GOP-хвост с keyframe-входом — декодер стартует с него) и
+    дальше потребляет только новые записи.
+
+    Зачем: раньше каждый HTTP-запрос (особенно /frame) открывал НОВУЮ
+    VTM-сессию — handshake с облаком занимал 1–3 с вдобавок к ожиданию
+    I-кадра. Теперь подключение клиента к «тёплому» потоку мгновенное.
+
+    Если сессия падает (сбой облака, обрыв) — читатель перезапускает её;
+    клиенты замечают смену генерации (gen) и берут новый снимок."""
+
+    def __init__(self):
+        self.cond = threading.Condition()
+        self.log = []            # (seq, data, is_keyframe)
+        self.seq = 0
+        self.gen = 0             # растёт при каждом (пере)запуске сессии
+        self.annexb = True
+        self.codec = None
+        self.last_data = 0.0
+
+    def begin(self, annexb: bool, codec) -> None:
+        """(Пере)запуск сессии: свежий лог, новая генерация."""
+        with self.cond:
+            self.gen += 1
+            self.annexb = annexb
+            self.codec = codec
+            self.log.clear()
+            self.cond.notify_all()
+
+    @staticmethod
+    def _keyframe_in(data: bytes) -> bool:
+        """Есть ли keyframe NAL в куске Annex-B (HEVC 16-21 / H.264 IDR=5)."""
+        pos = 0
+        while True:
+            i = data.find(b"\x00\x00\x01", pos)
+            if i < 0:
+                return False
+            hdr = i + 3
+            if hdr < len(data):
+                t = data[hdr]
+                if ((t >> 1) & 0x3F) in range(16, 22) or (t & 0x1F) == 5:
+                    return True
+            pos = hdr
+
+    def append(self, data: bytes) -> None:
+        """Данные от читателя: в лог + разбудить клиентов."""
+        if not data:
+            return
+        kf = self._keyframe_in(data) if self.annexb else False
+        with self.cond:
+            self.seq += 1
+            self.log.append((self.seq, data, kf))
+            self.last_data = time.time()
+            self._trim()
+            self.cond.notify_all()
+
+    def _trim(self) -> None:
+        """Под lock. Для Annex-B отбрасываем ДО (не включая) ПЕРВОГО keyframe
+        (он — точка входа декодера); для TS — по байтам (маркера keyframe в
+        TS нет). Жёсткий байтовый лимит — fallback, если keyframe не нашёлс
+        (повреждённый поток) или кольцо всё равно велико."""
+        total = sum(len(d) for _s, d, _k in self.log)
+        if self.annexb and total > _RING_MAX_BYTES:
+            i = 0
+            for j, (_s, _d, k) in enumerate(self.log):
+                if k:
+                    i = j
+                    break
+            if i:
+                del self.log[:i]
+        total = sum(len(d) for _s, d, _k in self.log)
+        while self.log and total > _RING_MAX_BYTES:
+            _s, d, _k = self.log.pop(0)
+            total -= len(d)
 
 
 def serve(serial: str, port: int, key: str, channel: int = 1,
@@ -1112,6 +1227,123 @@ def serve(serial: str, port: int, key: str, channel: int = 1,
         except Exception:
             pass
 
+    # ------------------------------------------------------------------
+    # ФОНОВАЯ VTM-сессия: один на воркер, а не на каждый запрос. Читатель
+    # держит облачный поток открытым и наполняет лог; клиенты подключаются
+    # к нему (см. [[_StreamSession]]). До этого каждый запрос открывал
+    # новую VTM-сессию — handshake 1–3 с поверх ожидания I-кадра.
+    # ------------------------------------------------------------------
+    session = _StreamSession()
+
+    def _open_session_once():
+        """Открыть VTM-сессию, определить формат/codec.
+
+        Возвращает (cm, pkts, buffered, transform, keyerr, annexb, codec);
+        при неудаче None (флаги и инвалидация кеша уже применены)."""
+        # "auto": сначала МАЛЫЙ поток, если кадр не придёт — основной ([[serve]]).
+        # `set_substream` вызывается заново для каждой попытки, потому что он
+        # подменяет формирователь URL библиотеки.
+        attempts = [("sub", STREAM_PROBE_TIMEOUT), (mode, 20.0)] if mode == "auto" \
+            else [(mode, 20.0)]
+        last_err = None
+        for want, tmo in attempts:
+            is_probe = want == "sub" and mode == "auto"
+            set_substream(want == "sub")
+            try:
+                cm = open_cloud_stream(client, serial, channel=channel,
+                                       client_type=9, refresh_vtm=False, timeout=tmo)
+            except Exception as e:
+                last_err = e
+                if is_probe:
+                    continue                      # нет substream — пробуем основной
+                break
+            try:
+                stream = cm.__enter__()
+                stream.start()
+                pkts = stream.iter_packets()
+                buffered, is_rtp, codec = _prime_packets(pkts)
+            except Exception as e:
+                try:
+                    cm.__exit__(None, None, None)
+                except Exception:
+                    pass
+                last_err = e
+                if is_probe:
+                    continue                      # сокет молчит — к основному
+                break
+            if not buffered:
+                try:
+                    cm.__exit__(None, None, None)
+                except Exception:
+                    pass
+                if is_probe:
+                    continue
+                last_err = last_err or RuntimeError("no packets from cloud")
+                break
+            # Формат/codec и декодер — на ВСЮ сессию (декодер состоянийый:
+            # решение об inter-шифре, RTP seq-трекинг).
+            if not is_rtp and buffered[0][:1] == b"\x47":
+                annexb, codec = False, None       # MPEG-TS (без шифра)
+                transform = lambda b: b
+                keyerr = lambda: False
+            elif not is_rtp:
+                dec = PsStreamDecryptor(key, cache_key=ck)   # MPEG-PS (H.264/HEVC авто)
+                annexb, codec = True, None
+                transform = dec.feed; keyerr = lambda: dec.key_error
+            elif codec == "h264":
+                dec = H264RtpDecryptor(key, cache_key=ck)    # RTP/H.264
+                annexb, codec = True, "h264"
+                transform = dec.feed; keyerr = lambda: dec.key_error
+            else:
+                dec = HevcRtpDecryptor(key, cache_key=ck)    # RTP/HEVC
+                annexb, codec = True, codec or "hevc"
+                transform = dec.feed; keyerr = lambda: dec.key_error
+            return cm, pkts, buffered, transform, keyerr, annexb, codec
+        # Не открылось — старые правила (флаги / инвалидация кеша).
+        # Офлайн-устройство НЕ СТИРАЕТ кеш — причина в [[_is_missing_resource]].
+        e = str(last_err or "")
+        if "offline" in e.lower() or "unreachable" in e.lower() \
+                or _is_missing_resource(last_err):
+            _flag_offline()
+        else:
+            vtm_cache.invalidate(_CACHE_KEY)   # метаданные могли устареть
+        return None
+
+    def _reader():
+        """Читатель: держит VTM-сессию открытой и наполняет лог. При неудаче
+        — перезапуск с backoff; клиенты замечают по смене gen."""
+        backoff = 2.0
+        while True:
+            opened = _open_session_once()
+            if opened is None:
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 30.0)
+                continue
+            backoff = 2.0
+            cm, pkts, buffered, transform, keyerr, annexb, codec = opened
+            session.begin(annexb, codec)
+            try:
+                # Прайм-пакеты — тоже часть потока, отдаём их
+                for b in buffered:
+                    data = transform(b)
+                    if data:
+                        session.append(data)
+                for pkt in pkts:
+                    if keyerr():
+                        _flag_keyerror()
+                        break
+                    data = transform(bytes(pkt.body))
+                    if data:
+                        session.append(data)
+            except Exception as e:
+                print("vtm session ended: %r" % (e,), file=sys.stderr, flush=True)
+            finally:
+                try:
+                    cm.__exit__(None, None, None)
+                except Exception:
+                    pass
+            time.sleep(min(backoff, 5.0))      # пауза между перезапусками
+
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *a):
             pass
@@ -1119,154 +1351,60 @@ def serve(serial: str, port: int, key: str, channel: int = 1,
         def do_GET(self):
             # Декодируем сырой поток и передаём напрямую (без внутреннего ffmpeg):
             #   RTP/PS -> Annex-B (H.264/HEVC), MPEG-TS -> как есть.
-            # Внешний ffmpeg (stream_manager) определит codec auto-detect и устойчиво декодирует.
+            # Внешний ffmpeg (stream_manager) определит codec auto-detect и
+            # устойчиво декодирует.
             # Есть ли этот КАНАЛ среди облачных ресурсов? Даже если NVR online,
             # отсутствующий канал никогда не отдаст поток — не ждём 20s,
-            # а возвращаем ТОЧНУЮ причину, а не "offline" ([[vtm_cache.channel_missing]]).
+            # а возвращаем ТОЧНУЮ причину, а не "offline".
             if vtm_cache.channel_missing(_CACHE_KEY, serial, channel):
                 _flag_offline()
                 self.send_error(404, "channel not in cloud device list")
                 return
-            got_packets = False          # кеш инвалидируется ТОЛЬКО если пакет не пришёл
-
-            def _prime(pkts):
-                """Читает начальные пакеты, чтобы определить
-                формат (RTP/PS/TS) и codec (H.264/HEVC) (потом они тоже передадутся)."""
-                buffered, is_rtp, codec = [], None, None
-                for pkt in pkts:
-                    b = bytes(pkt.body)
-                    buffered.append(b)
-                    if is_rtp is None:
-                        is_rtp = len(b) >= 1 and (b[0] >> 6) == 2
-                    if not is_rtp:
-                        break  # MPEG-PS или TS
-                    if (b[1] & 0x7F) == HEVC_VIDEO_PT:
-                        pl = rtp_payload(b)
-                        if len(pl) >= 1:
-                            codec = detect_rtp_codec(pl[0])
-                            if codec:
-                                break
-                    # сканируем до keyframe/однозначного маркера (для длинного GOP)
-                    if len(buffered) >= 400:
+            # Ждём готовности фоновой сессии (первые данные)
+            deadline = time.time() + 20.0
+            while True:
+                with session.cond:
+                    if session.seq > 0:
                         break
-                return buffered, is_rtp, codec
-
-            def _fail_open(e):
-                """Поток вообще не открылся — флагируем причину и возвращаем 502.
-
-                Офлайн-устройство НЕ СТИРАЕТ кеш — причина в
-                [[_is_missing_resource]]: кеш ведётся ПО АККАУНТУ, то есть одна
-                офлайн-камера инвалидировала бы метаданные всего аккаунта."""
-                if "offline" in str(e).lower() or "unreachable" in str(e).lower():
-                    _flag_offline()
-                elif _is_missing_resource(e):
-                    _flag_offline()
-                else:
-                    vtm_cache.invalidate(_CACHE_KEY)   # метаданные могли устареть
-                self.send_error(502)
-
-            # "auto": сначала МАЛЫЙ поток, если кадр не придёт — основной ([[serve]]).
-            # `set_substream` вызывается заново для каждой попытки, потому что он
-            # подменяет формирователь URL библиотеки.
-            attempts = [("sub", STREAM_PROBE_TIMEOUT), ("main", 20.0)] if mode == "auto" \
-                else [(mode, 20.0)]
-            opened = None
-            for want, tmo in attempts:
-                # Эта попытка PROBE (т.е. при неудаче есть следующая)
-                is_probe = want == "sub" and mode == "auto"
-                set_substream(want == "sub")
-                try:
-                    cm = open_cloud_stream(client, serial, channel=channel,
-                                           client_type=9, refresh_vtm=False, timeout=tmo)
-                except Exception as e:
-                    if is_probe:
-                        continue                      # нет substream — пробуем основной
-                    _fail_open(e)
+                if time.time() > deadline:
+                    self.send_error(502, "stream not ready (cloud relay slow?)")
                     return
-                try:
-                    stream = cm.__enter__()
-                    stream.start()
-                    pkts = stream.iter_packets()
-                    primed = _prime(pkts)
-                except Exception as e:
-                    try:
-                        cm.__exit__(None, None, None)
-                    except Exception:
-                        pass
-                    if is_probe:
-                        continue                      # сокет молчит — к основному
-                    # Эта ветка НЕ ДОСТИГАЕТ внешнего `except` (он
-                    # начинается ниже), поэтому разбираемся здесь.
-                    _fail_open(e)
-                    return
-                if primed[0] or not is_probe:
-                    opened = (cm, stream, pkts, primed)
-                    break
-                cm.__exit__(None, None, None)         # substream пустой — следующая попытка
+                time.sleep(0.2)
 
-            if opened is None:
-                self.send_error(502)
-                return
-            stream_cm, _stream, pkts, (buffered, is_rtp, codec) = opened
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+
+            # Запись в ОТДЕЛЬНОМ thread и с КОНТРОЛЕМ ([[PacedWriter]]) —
+            # облачный reader никогда не блокируется, а 2-секундные
+            # bursts распределяются по ровному потоку.
+            writer = PacedWriter(self.wfile, session.codec,
+                                 paced=session.annexb and PACE_FRAMES).start()
+            gen, last = -1, 0
             try:
-                # `stream_cm` открыт ВЫШЕ (`__enter__`) — для probe
-                # нужно было прочитать пакеты; поэтому закрываем не в `with`,
-                # а в `finally`.
-                try:
-                    if not buffered:
-                        self.send_error(502)
-                        return
+                while not writer.failed:
+                    with session.cond:
+                        session.cond.wait_for(
+                            lambda: session.seq > last or session.gen != gen,
+                            timeout=15.0)
+                        if session.gen != gen:
+                            gen = session.gen     # сессия перезапущена — новый снимок
+                            last = 0
+                        items = [d for s, d, _k in session.log if s > last]
+                        last = session.seq
+                    for it in items:
+                        if writer.failed:
+                            break
+                        writer.feed(it)
+                    # Поток молчит долго (сессия упала, читатель перезапускает)
+                    # — закрываем; клиент (ffmpeg/VLC) переподключится.
+                    if session.seq and time.time() - session.last_data > 30.0:
+                        break
+            finally:
+                writer.close()
 
-                    annexb = True                            # выдаём ли Annex-B (для pacing)
-                    if not is_rtp and buffered[0][:1] == b"\x47":
-                        transform = lambda b: b              # MPEG-TS (без шифра)
-                        keyerr = lambda: False
-                        annexb = False
-                    elif not is_rtp:
-                        dec = PsStreamDecryptor(key, cache_key=ck)  # MPEG-PS (H.264/HEVC авто)
-                        transform = dec.feed; keyerr = lambda: dec.key_error
-                    elif codec == "h264":
-                        dec = H264RtpDecryptor(key, cache_key=ck)   # RTP/H.264
-                        transform = dec.feed; keyerr = lambda: dec.key_error
-                    else:
-                        dec = HevcRtpDecryptor(key, cache_key=ck)   # RTP/HEVC
-                        transform = dec.feed; keyerr = lambda: dec.key_error
-
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/octet-stream")
-                    self.send_header("Cache-Control", "no-store")
-                    self.end_headers()
-
-                    # Запись в ОТДЕЛЬНОМ thread и с КОНТРОЛЕМ ([[PacedWriter]]) —
-                    # облачный reader никогда не блокируется, а 2-секундные
-                    # bursts распределяются по ровному потоку.
-                    writer = PacedWriter(self.wfile, codec, paced=annexb and PACE_FRAMES).start()
-                    try:
-                        for body in chain(buffered, (bytes(p.body) for p in pkts)):
-                            data = transform(body)
-                            if keyerr():
-                                _flag_keyerror()
-                                break
-                            if data:
-                                got_packets = True
-                                writer.feed(data)
-                            if writer.failed:
-                                break          # клиент отключился
-                    finally:
-                        writer.close()
-                finally:
-                    stream_cm.__exit__(None, None, None)
-            except (BrokenPipeError, ConnectionResetError, OSError):
-                pass
-            except Exception as e:
-                if "offline" in str(e).lower() or "unreachable" in str(e).lower():
-                    _flag_offline()
-                elif not got_packets and not _is_missing_resource(e):
-                    # Не пришёл ни один пакет -> метаданные в кеше (token VTDU)
-                    # могли устареть. Если пакет пришёл, кеш был ВЕРЕН —
-                    # разрыв по другой причине, не трогаем.
-                    vtm_cache.invalidate(_CACHE_KEY)
-
+    threading.Thread(target=_reader, daemon=True).start()
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     server.daemon_threads = True
     try:
