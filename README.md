@@ -69,6 +69,7 @@ curl -o cam8_hd.jpg "http://<host>:8000/frame?channel=8&stream=main"
 | `GET /frame?channel=N&stream=main` | FullHD JPEG из потока (1920×1080) |
 | `GET /prime?channel=N&stream=main` | прогреть воркер заранее (тёплый старт) |
 | `GET /workers` | диагностика: воркеры, активные клиенты, простой (idle-timeout) |
+| `GET /logs?tail=N` | хвост app.log; `?worker=worker_<serial>_<ch>_<mode>` — лог воркера |
 
 Другая камера — меняется `channel=`.
 
@@ -135,3 +136,25 @@ HLS `:8080/cam8/index.m3u8`, Web-плеер `:1984`.
 
 `token.json` / `cam_keys.json` — в volume `data` (после деплоя
 `hikcloud2rtc_data`), переживают перезапуск.
+
+## Логи
+
+Три уровня:
+
+- **app.log** — сервис (запросы, воркеры, reaper, 502-ретраи). Файл
+  `LOG_DIR/app.log` (по умолчанию `/app/data/logs`, т.е. в volume `data` —
+  переживает деплой), ротация 5×5 МБ. Дублируется в console → `docker logs`.
+- **`worker_<serial>_<ch>_<mode>.log`** — stderr каждого воркера
+  (VTM-сессия, обрывы). В том же `LOG_DIR`, переживает деплой.
+- **docker json-file** — console-лог контейнера, ограничен
+  `max-size: 10m, max-file: 3` (составная часть compose).
+
+Смотреть:
+
+```bash
+# из контейнера / на хосте
+docker logs hikcloud2rtc --tail 100 -f
+# через API (без доступа к хосту)
+curl "http://<host>:8000/logs?tail=50"
+curl "http://<host>:8000/logs?worker=worker_J88212190_8_main&tail=20"
+```
