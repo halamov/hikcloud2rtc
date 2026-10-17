@@ -847,6 +847,12 @@ def snapshot(channel: int = Query(DEFAULT_CHANNEL)):
             if c2 is None:
                 raise HTTPException(502, "snapshot relogin failed")
             data = c2.capture_snapshot(cam)
+        # hikcloudstream возвращает лишний байт(ы) после EOI (0xFFD9) — обрезаем хвост,
+        # чтобы JPEG заканчивался штатным маркером.
+        if data[:2] == b"\xff\xd8":
+            eoi = data.rfind(b"\xff\xd9")
+            if eoi >= 0:
+                data = data[: eoi + 2]
         return Response(data, media_type="image/jpeg")
     except HTTPException:
         raise
