@@ -28,12 +28,13 @@ services:
     image: hikcloud2rtc:latest
     container_name: hikcloud2rtc
     restart: unless-stopped
-    # console-лог (docker logs) — с ротацией, чтобы не рос вечно
+    # console-лог (docker logs) — с ротацией, чтобы не рос вечно.
+    # Стандарт домашней сети: max-size 10m, max-file 1 (единый по всем хостам Dockhand)
     logging:
       driver: json-file
       options:
         max-size: "10m"
-        max-file: "3"
+        max-file: "1"
     ports:
       - "8000:8000"      # python API: /health /cameras /snapshot /frame /stream.ts /keys/*
     environment:
