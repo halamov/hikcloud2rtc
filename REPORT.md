@@ -16,6 +16,8 @@ Hik-Connect NVR → HTTP-сервис видео-потока и снапшот�
 | `ecb076c` | Воркер: фоновая VTM-сессия (тёплые фреймы) + оптимизации A/B/C/D |
 | `cd943dd` | `WORKER_MODE=always\|idle` + `WORKER_IDLE_TIMEOUT` + `/prime`; idle-reaper — фикс утечки активных клиентов при обрыве /frame и /stream.ts |
 | `eb3a8c5` | Документация: endpoint `/workers` + WORKER_MODE в README |
+| `04a5d85` | snapshot: re-login + 1 retry при 401 (токен hikcloudstream истёк; клиент жил «один раз на аптайм») |
+| `f4bd514` | Логи: `LOG_DIR` (volume) + RotatingFileHandler app.log (5×5 МБ), воркер-логи в volume (были в /tmp — сгорали при деплое), docker json-file max-size 10m×3, эндпоинт `/logs` (хвост app.log / воркер-лога без доступа к хосту) |
 
 ## Ключевые решения
 - **Рабочая модель воркера:** фоновая VTM-сессия держит поток открытым постоянно (режим `always`) или с тайм-аутом в простое (`idle` + `/prime` для «прогрева»). Без воркера каждый запрос к потоку переподключался с нуля.
