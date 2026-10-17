@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import logging.handlers
 import os
 import queue
 import socket
@@ -57,11 +58,24 @@ from cloudcam.client import CloudClient, MfaRequired
 
 from hikcloudstream import Credentials, HikConnectClient
 
+DATA_DIR = os.environ.get("DATA_DIR", "/app/data")
+LOG_DIR = os.environ.get("LOG_DIR", f"{DATA_DIR}/logs")
+
 log = logging.getLogger("hiksvc")
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(name)s %(message)s")
-
-DATA_DIR = os.environ.get("DATA_DIR", "/app/data")
+# Файловый лог с ротацией (volume data → переживает деплои):
+# console остаётся для `docker logs`, файл — для истории.
+try:
+    os.makedirs(LOG_DIR, exist_ok=True)
+    _fileh = logging.handlers.RotatingFileHandler(
+        os.path.join(LOG_DIR, "app.log"), maxBytes=5 * 1024 * 1024,
+        backupCount=5, encoding="utf-8")
+    _fileh.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)s %(name)s %(message)s"))
+    logging.getLogger().addHandler(_fileh)
+except OSError as e:  # noqa: BLE001
+    log.warning("file logging disabled: %s", e)
 HIK_USER = os.environ.get("HIK_USER", "")
 HIK_PASSWORD = os.environ.get("HIK_PASSWORD", "")
 DEFAULT_CHANNEL = int(os.environ.get("CHANNEL", "0"))
@@ -134,6 +148,35 @@ def workers_debug():
                 "port": w["port"],
             })
     return {"mode": WORKER_MODE, "workers": out}
+
+
+@app.get("/logs")
+def logs_tail(worker: str = Query("", description="'' = app.log; иначе worker_<serial>_<ch>_<mode>"),
+              tail: int = Query(100, ge=1, le=2000)):
+    """Хвост файла лога (app.log или воркер-лог) без доступа к хосту.
+
+    GET /logs?tail=50                     → последние 50 строк app.log
+    GET /logs?worker=worker_J88212190_8_main&tail=20 → хвост лога воркера
+    """
+    if worker:
+        # защита: только worker_*.log внутри LOG_DIR, без ..
+        if not worker.startswith("worker_") or "/" in worker or ".." in worker:
+            raise HTTPException(400, "worker must be worker_<serial>_<ch>_<mode>")
+        path = Path(LOG_DIR) / (worker + ".log")
+    else:
+        path = Path(LOG_DIR) / "app.log"
+    if not path.is_file():
+        raise HTTPException(404, f"log file {path.name} not found")
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - 512 * 1024))  # не более ~512 КБ в запросе
+            data = f.read()
+    except OSError as e:
+        raise HTTPException(500, f"read log failed: {e}") from e
+    lines = data.decode("utf-8", "replace").splitlines()
+    return {"file": path.name, "size": size, "lines": lines[-tail:]}
 
 
 # ---------------- camera list ----------------
@@ -306,10 +349,13 @@ def _ensure_worker(serial: str, channel: int, mode: str) -> int:
         # оставит сирот, державших порты и VTM-сессии ([[watch_parent]]).
         env["CLOUDCAM_PARENT_WATCH"] = "1"
         try:
+            os.makedirs(LOG_DIR, exist_ok=True)
+            # Лог воркера — в volume (переживает деплой), а не в /tmp.
+            wlog = os.path.join(LOG_DIR, f"worker_{serial}_{channel}_{mode}.log")
             proc = subprocess.Popen(
                 cmd, cwd=os.path.dirname(os.path.abspath(__file__)), env=env,
                 stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
-                stderr=open(f"/tmp/worker_{serial}_{channel}_{mode}.log", "ab", buffering=0))
+                stderr=open(wlog, "ab", buffering=0))
         except Exception as e:  # noqa: BLE001
             raise HTTPException(502, f"worker start failed: {e}") from e
         _workers[key] = {"proc": proc, "port": port,

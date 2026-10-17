@@ -28,6 +28,12 @@ services:
     image: hikcloud2rtc:latest
     container_name: hikcloud2rtc
     restart: unless-stopped
+    # console-лог (docker logs) — с ротацией, чтобы не рос вечно
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     ports:
       - "8000:8000"      # python API: /health /cameras /snapshot /frame /stream.ts /keys/*
     environment:
@@ -37,6 +43,8 @@ services:
       - PORT=8000
       # данные (токены, cam-ключи) живут в volume (compose: hikcloud2rtc_data)
       - DATA_DIR=/app/data
+      # логи (app.log + worker_*.log с ротацией) — в том же volume, переживают деплой
+      - LOG_DIR=/app/data/logs
       - TOKEN_FILE=/app/data/token.json
       - CAM_KEYS_FILE=/app/data/cam_keys.json
       - CLOUDCAM_TOKEN_FILE=/app/data/token.json
