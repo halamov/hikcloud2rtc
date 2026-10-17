@@ -749,17 +749,30 @@ _snap_client: HikConnectClient | None = None
 _snap_cams: list = []
 
 
+def _snap_login() -> None:
+    """(Пере)логин в hikcloudstream и перечитать список камер."""
+    if not HIK_USER or not HIK_PASSWORD:
+        raise HTTPException(502, "HIK_USER/HIK_PASSWORD not set")
+    global _snap_client, _snap_cams
+    client = HikConnectClient()
+    client.login(Credentials(HIK_USER, HIK_PASSWORD))
+    cams = client.list_cameras()
+    _snap_client = client
+    _snap_cams = cams
+    log.info("hikcloudstream login ok, %d cameras", len(cams))
+
+
 def _snap() -> HikConnectClient:
     global _snap_client, _snap_cams
     with _snap_lock:
         if _snap_client is None:
-            if not HIK_USER or not HIK_PASSWORD:
-                raise HTTPException(502, "HIK_USER/HIK_PASSWORD not set")
-            _snap_client = HikConnectClient()
-            _snap_client.login(Credentials(HIK_USER, HIK_PASSWORD))
-            _snap_cams = _snap_client.list_cameras()
-            log.info("hikcloudstream login ok, %d cameras", len(_snap_cams))
+            _snap_login()
         return _snap_client
+
+
+def _is_unauthorized(e: Exception) -> bool:
+    s = str(e)
+    return "401" in s or "Unauthorized" in s or "unauthorized" in s
 
 
 @app.get("/snapshot")
@@ -773,7 +786,21 @@ def snapshot(channel: int = Query(DEFAULT_CHANNEL)):
             if cam is None:
                 raise HTTPException(404, f"channel {channel} not found; "
                                          f"available: {[x.channel_no for x in _snap_cams]}")
-        data = c.capture_snapshot(cam)
+        try:
+            data = c.capture_snapshot(cam)
+        except Exception as e:  # noqa: BLE001
+            # 401 — токен снапшот-клиента истёк (он логируется один раз на
+            # весь аптайм): перезалогиниваемся и повторяем один раз.
+            if not _is_unauthorized(e):
+                raise
+            with _snap_lock:
+                _snap_login()
+            c2 = _snap_client
+            cam = next((x for x in _snap_cams if x.channel_no == channel),
+                       _snap_cams[0]) if channel > 0 else _snap_cams[0]
+            if c2 is None:
+                raise HTTPException(502, "snapshot relogin failed")
+            data = c2.capture_snapshot(cam)
         return Response(data, media_type="image/jpeg")
     except HTTPException:
         raise
