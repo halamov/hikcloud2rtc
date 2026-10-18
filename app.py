@@ -1133,7 +1133,7 @@ def _preview_bottom_label(canvas, x0, y0, PW, PH, LABEL_H, font, label):
     ov = Image.new("RGBA", (PW, band), (0, 0, 0, 0))
     od = ImageDraw.Draw(ov)
     for yy in range(band):
-        a = int(190 * ((yy + 1) / band) ** 1.6)   # 0 → ~190 к нижнему краю
+        a = int(235 * ((yy + 1) / band) ** 1.6)   # 0 → ~235 к нижнему краю (плотнее)
         od.line((0, yy, PW, yy), fill=(10, 10, 14, a))
     canvas.paste(ov, (x0, ytop), ov)
     d = ImageDraw.Draw(canvas)
