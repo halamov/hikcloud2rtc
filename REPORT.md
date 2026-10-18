@@ -17,15 +17,17 @@ Hik-Connect NVR → HTTP-сервис видео-потока и снапшот�
 | `cd943dd` | `WORKER_MODE=always\|idle` + `WORKER_IDLE_TIMEOUT` + `/prime`; idle-reaper — фикс утечки активных клиентов при обрыве /frame и /stream.ts |
 | `eb3a8c5` | Документация: endpoint `/workers` + WORKER_MODE в README |
 | `04a5d85` | snapshot: re-login + 1 retry при 401 (токен hikcloudstream истёк; клиент жил «один раз на аптайм») |
-| `f4bd514` | Логи: `LOG_DIR` (volume) + RotatingFileHandler app.log (5×5 МБ), воркер-логи в volume (были в /tmp — сгорали при деплое), docker json-file лимит, эндпоинт `/logs` (хвост app.log / воркер-лога без доступа к хосту) |
-| `350d5b4` | compose: json-file `10m × 1` — единый стандарт логов по всем хостам Dockhand (pn40/vps1/nuc2/vps2, 32/32 контейнера) |
-| `89d5e88` | snapshot: обрезка лишнего байта после EOI (hikcloudstream дописывает 0x00 после FFD9); презентация: слайд 16 — долгие тесты 4 комбинаций |
-| `834c693` | env: упразднены `TOKEN_FILE`/`CAM_KEYS_FILE` — единый набор `CLOUDCAM_TOKEN_FILE`/`CLOUDCAM_CAMKEY_FILE` (их читают и cloudcam, и app) |
-| `900bc42` | compose: явный `hostname: hikcloud2rtc` + `network_mode: bridge` |
-| `c75a60d` | compose: убран блок `logging:` — наследуем глобальный дефолт демона (`daemon.json` json-file 10m×1) |
-| `894a412` | тег образа `0.<ГГ><ММ><ДД>.<ЧЧ>` (переменная `HIKCLOUD2RTC_TAG`, обязательная; `latest` больше не просачивается) |
-| `2bedb46` | `HIK_PLATFORM` (.env) → `CLOUDCAM_PLATFORM`: платформа облака `hikconnect` (дефолт) / `ezviz` (EZVIZ Life); комментарий со значениями в compose + .env.example, app.py учитывает HIK_PLATFORM при прямом запуске |
-| `2139055` | Эндпоинт `GET /preview` — сетка снапшотов всех камер (авто-раскладка под число доступных: 16→4×4, 10→5×2 …), оффлайн-камеры — NO SIGNAL-блок; шапка (название NVR, время, «онлайн N/M»), подписи CH+имя с обрезкой по реальной ширине; Pillow в `requirements.txt` |
+| `1f0431e` | Логи: `LOG_DIR` (volume) + RotatingFileHandler app.log (5×5 МБ), воркер-логи в volume (были в /tmp — сгорали при деплое), docker json-file лимит, эндпоинт `/logs` (хвост app.log / воркер-лога без доступа к хосту) |
+| `2645e5a` | compose: json-file `10m × 1` — единый стандарт логов по всем хостам Dockhand (pn40/vps1/nuc2/vps2, 32/32 контейнера) |
+| `a769a06` | snapshot: обрезка лишнего байта после EOI (hikcloudstream дописывает 0x00 после FFD9); презентация: слайд 16 — долгие тесты 4 комбинаций |
+| `5b73306` | env: упразднены `TOKEN_FILE`/`CAM_KEYS_FILE` — единый набор `CLOUDCAM_TOKEN_FILE`/`CLOUDCAM_CAMKEY_FILE` (их читают и cloudcam, и app) |
+| `d409090` | compose: явный `hostname: hikcloud2rtc` + `network_mode: bridge` |
+| `6055b68` | compose: убран блок `logging:` — наследуем глобальный дефолт демона (`daemon.json` json-file 10m×1) |
+| `841c02f` | тег образа `0.<ГГ><ММ><ДД>.<ЧЧ>` (переменная `HIKCLOUD2RTC_TAG`, обязательная; `latest` больше не просачивается) |
+| `55f1693` | `HIK_PLATFORM` (.env) → `CLOUDCAM_PLATFORM`: платформа облака `hikconnect` (дефолт) / `ezviz` (EZVIZ Life); комментарий со значениями в compose + .env.example, app.py учитывает HIK_PLATFORM при прямом запуске |
+| `ec58812` | Эндпоинт `GET /preview` — сетка снапшотов всех камер (авто-раскладка под число доступных: 16→4×4, 10→5×2 …), оффлайн-камеры — NO SIGNAL-блок; шапка (название NVR, время, «онлайн N/M»), подписи CH+имя с обрезкой по реальной ширине; Pillow в `requirements.txt` |
+| `b1debd5` | compose: `TZ` в `environment` — контейнер в часовой пояс хоста (шапка /preview, логи); было UTC |
+| `74497df` | `/snapshot` и `/frame`: оффлайн-камера → **200 + валидный JPEG «NO SIGNAL»** (как плитка /preview, плюс строка `error <код> — причина`) вместо HTTP-ошибки; код и причина в заголовках `X-Error`/`X-Error-Reason` (статус 200, `X-Camera-Status: no-signal`); CJK в облачных причинах гасится в `?` (DejaVuSans без CJK → не рисует «квадраты», заголовки latin-1 → не роняет 500) |
 
 ## Долгие тесты (18.10.2026, cam8)
 
