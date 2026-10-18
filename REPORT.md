@@ -52,5 +52,5 @@ Hik-Connect NVR → HTTP-сервис видео-потока и снапшот�
 - **Утечка клиентов:** при обрыве клиента ffmpeg-пайплайны и VTM-сессии собирались idle-reaper'ом.
 
 ## Деплой
-- Живёт на <host> (env 4, Dockhand) как git-стек с GitHub `halamov/hikcloud2rtc`, деплой через Dockhand API.
-- Тестовый хост <ip> (alias `hik`) — `/opt/hikcloud2rtc`, `docker compose up -d --build`; использовался для долгих тестов 18.10 (боевой режим на нём: idle + pace=0, как в проде).
+- Живёт на `<host>` (env 4, Dockhand) как git-стек с GitHub `halamov/hikcloud2rtc`, деплой через Dockhand API.
+- Тестовый хост (alias `hik`) — `/opt/hikcloud2rtc`, `docker compose up -d --build`; использовался для долгих тестов 18.10 (боевой режим на нём: idle + pace=0, как в проде).
