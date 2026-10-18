@@ -24,6 +24,7 @@ Hik-Connect NVR → HTTP-сервис видео-потока и снапшот�
 | `900bc42` | compose: явный `hostname: hikcloud2rtc` + `network_mode: bridge` |
 | `c75a60d` | compose: убран блок `logging:` — наследуем глобальный дефолт демона (`daemon.json` json-file 10m×1) |
 | `894a412` | тег образа `0.<ГГ><ММ><ДД>.<ЧЧ>` (переменная `HIKCLOUD2RTC_TAG`, обязательная; `latest` больше не просачивается) |
+| `2bedb46` | `HIK_PLATFORM` (.env) → `CLOUDCAM_PLATFORM`: платформа облака `hikconnect` (дефолт) / `ezviz` (EZVIZ Life); комментарий со значениями в compose + .env.example, app.py учитывает HIK_PLATFORM при прямом запуске |
 
 ## Долгие тесты (18.10.2026, cam8)
 
