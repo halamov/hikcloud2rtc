@@ -46,8 +46,8 @@ services:
       - DATA_DIR=/app/data
       # логи (app.log + worker_*.log с ротацией) — в том же volume, переживают деплой
       - LOG_DIR=/app/data/logs
-      - TOKEN_FILE=/app/data/token.json
-      - CAM_KEYS_FILE=/app/data/cam_keys.json
+      # пути к файлам токена и ключей камер — единый набор имён cloudcam
+      # (их же читает пакет cloudcam; старая пара TOKEN_FILE/CAM_KEYS_FILE упразднена)
       - CLOUDCAM_TOKEN_FILE=/app/data/token.json
       - CLOUDCAM_CAMKEY_FILE=/app/data/cam_keys.json
       # PacedWriter: очередь 2 МБ вместо 8 (у нас один зритель, не grid-23);

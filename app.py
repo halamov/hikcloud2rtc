@@ -19,8 +19,8 @@ Env:
   CHANNEL                  default NVR channel (0 = first active)
   STREAM                   default stream mode: sub|main|auto (default sub)
   PORT                     API port (default 8000)
-  TOKEN_FILE               cloudcam session token (default /app/data/token.json)
-  CAM_KEYS_FILE            camera keys, JSON {"SERIAL:CH": key} (default /app/data/cam_keys.json)
+  CLOUDCAM_TOKEN_FILE      cloudcam session token (default /app/data/token.json)
+  CLOUDCAM_CAMKEY_FILE     camera keys, JSON {"SERIAL:CH": key} (default /app/data/cam_keys.json)
 """
 from __future__ import annotations
 
@@ -45,8 +45,11 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import Response, StreamingResponse
 
 DATA_DIR = os.environ.get("DATA_DIR", "/app/data")
-TOKEN_FILE = os.environ.get("TOKEN_FILE", f"{DATA_DIR}/token.json")
-CAM_KEYS_FILE = os.environ.get("CAM_KEYS_FILE", f"{DATA_DIR}/cam_keys.json")
+# Пути файлов читаем ТОЛЬКО из CLOUDCAM_* (единственный источник имён —
+# их же читает пакет cloudcam через Settings.from_env; старые TOKEN_FILE /
+# CAM_KEYS_FILE упразднены, в compose дублирующая пара не прописывается).
+TOKEN_FILE = os.environ.get("CLOUDCAM_TOKEN_FILE", f"{DATA_DIR}/token.json")
+CAM_KEYS_FILE = os.environ.get("CLOUDCAM_CAMKEY_FILE", f"{DATA_DIR}/cam_keys.json")
 # must be set BEFORE cloudcam import: settings caches active config at import time
 os.makedirs(DATA_DIR, exist_ok=True)
 os.environ["CLOUDCAM_TOKEN_FILE"] = TOKEN_FILE
