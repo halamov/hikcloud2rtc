@@ -53,7 +53,8 @@ services:
       # PacedWriter: очередь 2 МБ вместо 8 (у нас один зритель, не grid-23);
       # 1/4 МБ — если захотеть ещё меньше задержки
       - PACE_QUEUE_MB=2
-      - CLOUDCAM_PLATFORM=hikconnect
+      # платформа облака — берётся из .env (HIK_PLATFORM), по умолчанию hikconnect
+      - CLOUDCAM_PLATFORM=${HIK_PLATFORM:-hikconnect}
       # PacedWriter: сглаживать ли кадровые bursts облака (GOP приходит за раз,
       # затем пауза ~2 с). 1 = кадры выдаются ровным потоком (плавная картинка,
       # глубина буфера ~1 с), 0 = кадры уходят сразу при получении (минимальная
