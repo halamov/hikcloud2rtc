@@ -20,6 +20,10 @@ Hik-Connect NVR → HTTP-сервис видео-потока и снапшот�
 | `f4bd514` | Логи: `LOG_DIR` (volume) + RotatingFileHandler app.log (5×5 МБ), воркер-логи в volume (были в /tmp — сгорали при деплое), docker json-file лимит, эндпоинт `/logs` (хвост app.log / воркер-лога без доступа к хосту) |
 | `350d5b4` | compose: json-file `10m × 1` — единый стандарт логов по всем хостам Dockhand (pn40/vps1/nuc2/vps2, 32/32 контейнера) |
 | `89d5e88` | snapshot: обрезка лишнего байта после EOI (hikcloudstream дописывает 0x00 после FFD9); презентация: слайд 16 — долгие тесты 4 комбинаций |
+| `834c693` | env: упразднены `TOKEN_FILE`/`CAM_KEYS_FILE` — единый набор `CLOUDCAM_TOKEN_FILE`/`CLOUDCAM_CAMKEY_FILE` (их читают и cloudcam, и app) |
+| `900bc42` | compose: явный `hostname: hikcloud2rtc` + `network_mode: bridge` |
+| `c75a60d` | compose: убран блок `logging:` — наследуем глобальный дефолт демона (`daemon.json` json-file 10m×1) |
+| `894a412` | тег образа `0.<ГГ><ММ><ДД>.<ЧЧ>` (переменная `HIKCLOUD2RTC_TAG`, обязательная; `latest` больше не просачивается) |
 
 ## Долгие тесты (18.10.2026, cam8)
 
