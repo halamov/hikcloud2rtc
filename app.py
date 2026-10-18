@@ -868,9 +868,14 @@ def _snap() -> HikConnectClient:
         return _snap_client
 
 
-def _is_unauthorized(e: Exception) -> bool:
+def _is_auth_reject(e: Exception) -> bool:
+    """401/403 от облака — сессия истекла/отвергнута (NE «камера оффлайн»):
+    перезалогиниться и повторить запрос. 403 бывает разовым сбоем облака —
+    тогда он приходит на ВСЕ камеры сразу (2026-10-18 22:06, вся сетка
+    /preview ушла в NO SIGNAL до следующего обращения)."""
     s = str(e)
-    return "401" in s or "Unauthorized" in s or "unauthorized" in s
+    return ("401" in s or "403" in s or "Unauthorized" in s
+            or "unauthorized" in s or "Forbidden" in s)
 
 
 @app.get("/snapshot")
@@ -887,9 +892,10 @@ def snapshot(channel: int = Query(DEFAULT_CHANNEL)):
         try:
             data = c.capture_snapshot(cam)
         except Exception as e:  # noqa: BLE001
-            # 401 — токен снапшот-клиента истёк (он логируется один раз на
-            # весь аптайм): перезалогиниваемся и повторяем один раз.
-            if not _is_unauthorized(e):
+            # 401/403 — токен/сессия снапшот-клиента истекла или облако
+            # отвергло (клиент логируется один раз на весь аптайм):
+            # перезалогиниваемся и повторяем один раз.
+            if not _is_auth_reject(e):
                 raise
             with _snap_lock:
                 _snap_login()
@@ -1126,7 +1132,7 @@ def preview(cell: int = Query(320, ge=120, le=640),
         raise HTTPException(500, "Pillow not installed in the image "
                                  "(pip install pillow)")
     try:
-        client = _snap()
+        _snap()  # гарантировать логин и _snap_cams
         cams = _snap_cams
     except HTTPException:
         raise
@@ -1149,19 +1155,40 @@ def preview(cell: int = Query(320, ge=120, le=640),
 
     def grab(cam):
         try:
-            data = client.capture_snapshot(cam)
+            data = _snap().capture_snapshot(cam)
             if data[:2] == b"\xff\xd8":
                 eoi = data.rfind(b"\xff\xd9")
                 if eoi >= 0:
                     data = data[:eoi + 2]
-            return cam.channel_no, data
+            return cam.channel_no, data, False
         except Exception as e:  # noqa: BLE001
+            rej = _is_auth_reject(e)
             log.info("preview: cam %s failed: %s", cam.channel_no, e)
-            return cam.channel_no, None
+            return cam.channel_no, None, rej
 
-    with ThreadPoolExecutor(max_workers=min(workers, len(cams))) as ex:
-        for ch, data in ex.map(grab, cams):
-            results[ch] = data
+    def grab_all(targets):
+        # ex.map читается последовательно в этом потоке — results
+        # пишется без гонок; rejects считаем здесь же (в main-потоке)
+        rej = 0
+        with ThreadPoolExecutor(max_workers=min(workers, len(targets))) as ex:
+            for ch, data, r in ex.map(grab, targets):
+                results[ch] = data
+                rej += r
+        return rej
+
+    rejects = grab_all(cams)
+    # Облачный сбой, а не камеры: 401/403 на половине+ каналов = сессия
+    # отвергнута целиком (2026-10-18 22:06 — 403 на все 16, вся сетка
+    # NO SIGNAL). Перелогин + один повтор упавших камер.
+    if rejects and rejects * 2 >= len(cams):
+        log.warning("preview: %d/%d auth rejects (401/403) — re-login, retry",
+                    rejects, len(cams))
+        try:
+            with _snap_lock:
+                _snap_login()
+            grab_all([c for c in cams if results[c.channel_no] is None])
+        except Exception as e:  # noqa: BLE001
+            log.warning("preview: re-login failed: %s", e)
 
     n = len(cams)
     cols = _preview_pick_cols(n)
