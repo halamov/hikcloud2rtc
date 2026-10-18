@@ -74,6 +74,9 @@ services:
       - WORKER_MODE=${WORKER_MODE:-always}
       # Через сколько секунд без клиентов убивать воркер (только в режиме idle)
       - WORKER_IDLE_TIMEOUT=${WORKER_IDLE_TIMEOUT:-90}
+      # Часовой пояс контейнера (datetime/timezone, время в шапке /preview, логи):
+      # tzdata в образе есть, TZ=Europe/Minsk берётся из .env
+      - TZ=${TZ:-UTC}
     volumes:
       - data:/app/data    # token.json + cam_keys.json переживают рестарт
     healthcheck:
