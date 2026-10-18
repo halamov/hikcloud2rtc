@@ -1149,7 +1149,7 @@ def _preview_top_header(canvas, CW, band, title, font):
     ov = Image.new("RGBA", (CW, band), (0, 0, 0, 0))
     od = ImageDraw.Draw(ov)
     for yy in range(band):
-        a = int(235 * (1 - yy / band) ** 1.6)   # 235 сверху → 0 к низу
+        a = int(250 * (1 - yy / band) ** 1.2)   # 250 сверху → 0 к низу (глубокая тень)
         od.line((0, yy, CW, yy), fill=(10, 10, 14, a))
     canvas.paste(ov, (0, 0), ov)
     d = ImageDraw.Draw(canvas)
