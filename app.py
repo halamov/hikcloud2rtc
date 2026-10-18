@@ -741,12 +741,24 @@ def frame(channel: int = Query(DEFAULT_CHANNEL),
     if not _wait_port(port, 8.0):
         raise HTTPException(502, f"stream worker (:{port}) did not start")
 
+    W, H = (640, 360) if stream == "sub" else (1920, 1080)
     out = Path(tempfile.mktemp(prefix="frame_", suffix=".jpg"))
     # Сбой VTM-облака (502 воркера) или обрыв потока до первого I-кадра —
     # частый случай: повторяем «открыть + дождаться I-кадра» пару раз.
+    # Камера не отвечает (502) или не отдаёт кадры (504) → вместо сырой
+    # HTTP-ошибки возвращаем JPEG «NO SIGNAL» с кодом ошибки и причиной
+    # (см. _offline_jpeg_response), чтобы <img>/дашборд рендерил кадр.
+    fail = None
+    jpeg = None
     try:
         for attempt in (1, 2):
-            r = _worker_open(port)  # ретраи на временный сбой VTM-облака
+            try:
+                r = _worker_open(port)  # ретраи на временный сбой VTM-облака
+            except HTTPException as e:  # 502: VTM не открылся (камера оффлайн)
+                fail = e
+                if attempt == 1:
+                    time.sleep(3.0)  # облако может восстановиться — повторяем
+                continue
             # Stream the live pipe straight into ffmpeg and pick the first
             # I-frame (IDR). The worker is persistent, so a capture can start
             # mid-GOP; decoding a P-frame there gives half-corrupted frames.
@@ -794,12 +806,18 @@ def frame(channel: int = Query(DEFAULT_CHANNEL),
                 jpeg = out.read_bytes()
                 break
             if attempt == 2:
-                raise HTTPException(504, "no keyframe (I-frame) in stream window")
+                fail = HTTPException(504, "no keyframe (I-frame) in stream window")
+                break
             time.sleep(3.0)  # облако может восстановиться — повторяем
     except subprocess.TimeoutExpired:
-        raise HTTPException(504, "decode timeout")
+        fail = HTTPException(504, "decode timeout")
     finally:
         out.unlink(missing_ok=True)
+    if jpeg is None:
+        if fail is None:
+            fail = HTTPException(504, "no keyframe (I-frame) in stream window")
+        return _offline_jpeg_response(fail.status_code, fail.detail, W, H,
+                                       label=f"CH {ch:02d}")
     log.info("frame %s ch=%d %s -> %d bytes", s, ch, stream, len(jpeg))
     return Response(jpeg, media_type="image/jpeg")
 
@@ -873,7 +891,14 @@ def snapshot(channel: int = Query(DEFAULT_CHANNEL)):
     except HTTPException:
         raise
     except Exception as e:  # noqa: BLE001
-        raise HTTPException(502, f"snapshot failed: {e}") from e
+        # Камера/облако не отвечает (2009 设备网络异常, 502 релея, таймаут) —
+        # возвращаем валидный JPEG «NO SIGNAL» с кодом ошибки (как /preview),
+        # чтобы <img>/дашборд рендерил кадр; для API-клиентов код — в
+        # X-Error / X-Error-Reason (статус 200, X-Camera-Status=no-signal).
+        code = getattr(e, "status_code", None)
+        if code not in (400, 401, 403, 404, 405, 409, 422, 429, 500, 501, 502, 503, 504):
+            code = 502
+        return _offline_jpeg_response(code, e, 352, 288, label=f"CH {channel:02d}")
 
 
 # ---------------- preview grid (все камеры одной картинкой) ----------------
@@ -971,6 +996,104 @@ def _preview_fit(d, text: str, font, max_w: int) -> str:
         if d.textlength(t, font=font) <= max_w:
             return t
     return text[:1]
+
+
+_GLYPH_CACHE: dict[tuple, bool] = {}
+
+
+def _font_can_render(font, ch: str) -> bool:
+    """Есть ли у шрифта глиф для ch (DejaVuSans без CJK — китайские
+    символы из облачных ошибок рисовались бы «квадратами»-tofu)."""
+    key = (getattr(font, "path", None) or id(font), ord(ch))
+    hit = _GLYPH_CACHE.get(key)
+    if hit is not None:
+        return hit
+    def _render(c: str) -> bytes:
+        im = Image.new("L", (80, 80), 0)
+        ImageDraw.Draw(im).text((0, 0), c, font=font, fill=255)
+        return im.tobytes()
+    try:
+        ok = _render(ch) != _render("\uffff")   # .notdef = пустой/рамка
+    except Exception:  # noqa: BLE001
+        ok = False
+    _GLYPH_CACHE[key] = ok
+    return ok
+
+
+def _preview_safe(text: str, font) -> str:
+    """Заменить в тексте символы, не отображаемые шрифтом, на '?'."""
+    return "".join(c if _font_can_render(font, c) else "?" for c in text)
+
+
+def _nosignal_jpeg(width: int, height: int, code=None, reason=None):
+    """JPEG-блок «NO SIGNAL» — камера недоступна (оффлайн/ошибка облака).
+
+    Выглядит как NO SIGNAL-плитка из /preview, но добавляет строку с кодом
+    ошибки и причиной. Возвращает байты JPEG или None, если нет Pillow."""
+    if not _PIL_OK:
+        return None
+    big = _preview_font(max(18, int(width * 0.06)))
+    mid = _preview_font(max(13, int(width * 0.042)))
+    sm = _preview_font(max(10, int(width * 0.032)))
+    rng = random.Random((width * 31 + height * 7) & 0xFFFFFFFF)
+    im = Image.new("RGB", (width, height), (22, 22, 26))
+    d = ImageDraw.Draw(im)
+    for _ in range(width * height // 300):
+        x, y = rng.randrange(width), rng.randrange(height)
+        g = rng.randrange(28, 60)
+        d.point((x, y), fill=(g, g, g))
+    for _ in range(5):
+        y = rng.randrange(height)
+        d.line((0, y, width, y), fill=(35, 35, 40), width=2)
+    cy = height / 2
+    d.text((width / 2, cy - height * 0.10), "NO SIGNAL", font=big,
+           fill=(120, 120, 128), anchor="mm")
+    d.text((width / 2, cy - height * 0.02), "камера оффлайн", font=mid,
+           fill=(90, 90, 96), anchor="mm")
+    err = f"error {code}" if code is not None else ""
+    if reason:
+        err = f"{err} — {reason}" if err else str(reason)
+    if err:
+        # облачные причины могут содержать CJK (设备网络异常), которого нет
+        # в DejaVuSans — гасим в '?', чтобы не рисовать «квадраты»-tofu
+        err = _preview_safe(err, sm)
+        d.text((width / 2, cy + height * 0.08),
+               _preview_fit(d, err, sm, width - 40), font=sm,
+               fill=(70, 70, 76), anchor="mm")
+    buf = io.BytesIO()
+    im.save(buf, "JPEG", quality=80)
+    return buf.getvalue()
+
+
+def _offline_jpeg_response(code: int, reason, width: int, height: int,
+                           label: str = ""):
+    """Камера недоступна → верни валидный JPEG «NO SIGNAL» со статусом 200.
+
+    URL тогда всегда отдаёт картинку (рендерится в <img>/дашборде), а код
+    ошибки и причина видны на кадре и в заголовках X-Error/X-Error-Reason
+    (для программного опроса). Без Pillow — честная HTTP-ошибка code."""
+    reason_s = str(reason)
+    if len(reason_s) > 120:
+        reason_s = reason_s[:117] + "…"
+    jpeg = None
+    try:
+        jpeg = _nosignal_jpeg(width, height, code, reason_s)
+    except Exception as e:  # noqa: BLE001
+        log.warning("offline image gen failed: %s", e)
+    if jpeg is None:
+        raise HTTPException(code, f"camera offline: {reason_s}")
+    headers = {"X-Camera-Status": "no-signal", "X-Error": str(code)}
+    if reason_s:
+        # HTTP-заголовки кодируются latin-1: CJK-символы облачных ошибок
+        # (设备网络异常...) бились в UnicodeEncodeError — гасим в '?'
+        headers["X-Error-Reason"] = (
+            reason_s[:200].encode("ascii", "replace").decode("ascii"))
+    if label:
+        headers["X-Camera"] = label
+    log.info("offline camera -> NO SIGNAL jpeg %dx%d (code %s: %s)",
+             width, height, code, reason_s[:80])
+    return Response(jpeg, media_type="image/jpeg", status_code=200,
+                    headers=headers)
 
 
 @app.get("/preview")
