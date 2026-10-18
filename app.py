@@ -26,11 +26,13 @@ Env:
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import logging
 import logging.handlers
 import os
 import queue
+import random
 import socket
 import subprocess
 import sys
@@ -39,11 +41,21 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Iterator
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import Response, StreamingResponse
+
+# Pillow нужен только для /preview (сетка снапшотов); без него сервис
+# работает как раньше, /preview отвечает 500 с пояснением.
+try:
+    from PIL import Image, ImageDraw, ImageFont
+    _PIL_OK = True
+except ImportError:  # pragma: no cover
+    Image = ImageDraw = ImageFont = None
+    _PIL_OK = False
 
 DATA_DIR = os.environ.get("DATA_DIR", "/app/data")
 # Пути файлов читаем ТОЛЬКО из CLOUDCAM_* (единственный источник имён —
@@ -862,6 +874,182 @@ def snapshot(channel: int = Query(DEFAULT_CHANNEL)):
         raise
     except Exception as e:  # noqa: BLE001
         raise HTTPException(502, f"snapshot failed: {e}") from e
+
+
+# ---------------- preview grid (все камеры одной картинкой) ----------------
+#
+# /preview?cell=320&workers=8  →  image/jpeg, сетка N×M из снапшотов.
+#  • Колонки подбираются автоматически под доступное число камер (2/3/4/5/8)
+#    так, чтобы раскладка была максимально равномерной (без «хвоста» из
+#    одиночной камеры, когда есть более полный вариант).
+#  • Недоступная камера (облако/аппарат не отвечает) рисуется блоком
+#    «NO SIGNAL» — сама сетка всё равно собирается.
+#  • Снапшоты берём у того же hikcloudstream-клиента, что и /snapshot
+#    (один общий login, параллельно по workers).
+#
+# Зависимости: Pillow (requirements.txt) + шрифт DejaVu (есть в
+# python:3.12-slim, /usr/share/fonts/truetype/dejavu).
+
+
+def _preview_pick_cols(n: int) -> int:
+    """Колонки под n камер: равномерная сетка, не более 8 колонок.
+
+    Разложимые n — самый «квадратный» делитель с cols >= rows
+    (16→4×4, 12→4×3, 10→5×2, 8→4×2). n ≤ 5 — один ряд.
+    Простые n — вариант с минимальным «хвостом», одиночную камеру
+    в последнем ряду не хотим (11→3×4: 3+3+3+2, 13→5×3: 5+5+3)."""
+    if n <= 5:
+        return max(1, n)
+    max_cols = min(8, n - 1)
+    cands = [d for d in range(2, max_cols + 1)
+             if n % d == 0 and d >= n // d]
+    if cands:
+        return min(cands, key=lambda d: (abs(d - n // d), d))
+    # делителей нет (n простое): минимизируем «хвост»
+    best, best_key = 4, None
+    for d in range(2, max_cols + 1):
+        rows = -(-n // d)
+        if rows < 2:
+            continue
+        last = n - (rows - 1) * d
+        key = (last == 1, abs(d - rows))
+        if best_key is None or key < best_key:
+            best, best_key = d, key
+    return best
+
+
+def _preview_tile(label_font, big_font, sm_font, w: int, h: int,
+                  data: bytes | None, seed: int):
+    """Одна плитка w×h: кадр (crop-fill 4:3) либо «NO SIGNAL» с шумом."""
+    if data and data[:2] == b"\xff\xd8":
+        im = Image.open(io.BytesIO(data)).convert("RGB")
+        iw, ih = im.size
+        target = w / h
+        if iw / ih > target:                      # обрезаем по ширине
+            nw = int(ih * target)
+            im = im.crop(((iw - nw) // 2, 0, (iw + nw) // 2, ih))
+        else:                                      # по высоте
+            nh = int(iw / target)
+            im = im.crop((0, (ih - nh) // 2, iw, (ih + nh) // 2))
+        return im.resize((w, h), Image.LANCZOS)
+    # NO SIGNAL — тёмный блок с шумом и линиями «помех»
+    rng = random.Random(seed)
+    im = Image.new("RGB", (w, h), (22, 22, 26))
+    d = ImageDraw.Draw(im)
+    for _ in range(w * h // 300):
+        x, y = rng.randrange(w), rng.randrange(h)
+        g = rng.randrange(28, 60)
+        d.point((x, y), fill=(g, g, g))
+    for _ in range(5):
+        y = rng.randrange(h)
+        d.line((0, y, w, y), fill=(35, 35, 40), width=2)
+    d.text((w / 2, h / 2 - 22), "NO SIGNAL", font=big_font, fill=(120, 120, 128),
+           anchor="mm")
+    d.text((w / 2, h / 2 + 14), "камера оффлайн", font=sm_font, fill=(90, 90, 96),
+           anchor="mm")
+    return im
+
+
+def _preview_font(size: int):
+    for path in ("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+                 "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"):
+        try:
+            return ImageFont.truetype(path, size)
+        except OSError:
+            continue
+    return ImageFont.load_default()
+
+
+def _preview_fit(d, text: str, font, max_w: int) -> str:
+    """Обрезать текст по РЕАЛЬНОЙ ширине (textlength) — по символам,
+    чтобы длинное имя камеры не налезло на соседнюю ячейку."""
+    if d.textlength(text, font=font) <= max_w:
+        return text
+    ell = "…"
+    for i in range(len(text), 0, -1):
+        t = text[:i] + ell
+        if d.textlength(t, font=font) <= max_w:
+            return t
+    return text[:1]
+
+
+@app.get("/preview")
+def preview(cell: int = Query(320, ge=120, le=640),
+            workers: int = Query(8, ge=1, le=16),
+            quality: int = Query(88, ge=40, le=95)):
+    """Сетка снапшотов всех камер облака: 4×4 / 4×3 / 3×2 ... по доступным."""
+    if not _PIL_OK:
+        raise HTTPException(500, "Pillow not installed in the image "
+                                 "(pip install pillow)")
+    try:
+        client = _snap()
+        cams = _snap_cams
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(502, f"camera list failed: {e}") from e
+    if not cams:
+        raise HTTPException(502, "no active cameras in cloud")
+
+    PW = cell
+    PH = max(90, int(PW * 3 / 4))       # 4:3, как у облачного снапшота
+    LABEL_H = max(20, int(PW * 0.09))
+    HEAD_H = max(28, int(PW * 0.12))
+
+    font = _preview_font(max(13, int(PW * 0.06)))
+    big = _preview_font(max(18, int(PW * 0.095)))
+    sm = _preview_font(max(11, int(PW * 0.05)))
+
+    # --- снапшоты (параллельно, один общий login-клиент) ---
+    results: dict[int, bytes | None] = {}
+
+    def grab(cam):
+        try:
+            data = client.capture_snapshot(cam)
+            if data[:2] == b"\xff\xd8":
+                eoi = data.rfind(b"\xff\xd9")
+                if eoi >= 0:
+                    data = data[:eoi + 2]
+            return cam.channel_no, data
+        except Exception as e:  # noqa: BLE001
+            log.info("preview: cam %s failed: %s", cam.channel_no, e)
+            return cam.channel_no, None
+
+    with ThreadPoolExecutor(max_workers=min(workers, len(cams))) as ex:
+        for ch, data in ex.map(grab, cams):
+            results[ch] = data
+
+    n = len(cams)
+    cols = _preview_pick_cols(n)
+    rows = (n + cols - 1) // cols
+    CW = cols * PW
+    CH = HEAD_H + rows * (PH + LABEL_H)
+
+    canvas = Image.new("RGB", (CW, CH), (8, 8, 10))
+    d = ImageDraw.Draw(canvas)
+    device = next((c.device_name for c in cams if getattr(c, "device_name", "")), "")
+    title = (f"{device}  •  {time.strftime('%d.%m.%Y %H:%M')}  •  "
+             f"онлайн {sum(1 for v in results.values() if v)}/{n}")
+    d.rectangle((0, 0, CW, HEAD_H), fill=(16, 16, 20))
+    d.text((10, HEAD_H // 2), title, font=font, fill=(235, 235, 240), anchor="lm")
+
+    by_ch = {c.channel_no: c for c in cams}
+    for i, ch in enumerate(sorted(by_ch)):
+        r, col = divmod(i, cols)
+        x0, y0 = col * PW, HEAD_H + r * (PH + LABEL_H)
+        cam = by_ch[ch]
+        canvas.paste(_preview_tile(font, big, sm, PW, PH,
+                                   results.get(ch), ch * 7919), (x0, y0))
+        d.rectangle((x0, y0, x0 + PW, y0 + PH), outline=(60, 60, 68), width=1)
+        label = f"CH {ch:02d}  {getattr(cam, 'name', '')}"
+        d.rectangle((x0, y0 + PH, x0 + PW, y0 + PH + LABEL_H), fill=(16, 16, 20))
+        d.text((x0 + 6, y0 + PH + LABEL_H // 2),
+               _preview_fit(d, label, font, PW - 12),
+               font=font, fill=(225, 225, 230), anchor="lm")
+
+    buf = io.BytesIO()
+    canvas.save(buf, "JPEG", quality=quality)
+    return Response(buf.getvalue(), media_type="image/jpeg")
 
 
 if __name__ == "__main__":
