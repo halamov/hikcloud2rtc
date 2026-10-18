@@ -27,6 +27,8 @@ services:
       dockerfile: Dockerfile
     image: hikcloud2rtc:latest
     container_name: hikcloud2rtc
+    hostname: hikcloud2rtc
+    network_mode: bridge
     restart: unless-stopped
     # console-лог (docker logs) — с ротацией, чтобы не рос вечно.
     # Стандарт домашней сети: max-size 10m, max-file 1 (единый по всем хостам Dockhand)
