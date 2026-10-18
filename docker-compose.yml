@@ -54,6 +54,10 @@ services:
       # 1/4 МБ — если захотеть ещё меньше задержки
       - PACE_QUEUE_MB=2
       # платформа облака — берётся из .env (HIK_PLATFORM), по умолчанию hikconnect
+      # значения (cloudcam/client.py PLATFORMS):
+      #   hikconnect — Hik-Connect (api.hik-connect.com, clientType 55)
+      #   ezviz      — EZVIZ / Ezviz Life (apiisgp.ezvizlife.com, clientType 1)
+      # неизвестное значение молча заменяется на hikconnect (client.py:59)
       - CLOUDCAM_PLATFORM=${HIK_PLATFORM:-hikconnect}
       # PacedWriter: сглаживать ли кадровые bursts облака (GOP приходит за раз,
       # затем пауза ~2 с). 1 = кадры выдаются ровным потоком (плавная картинка,

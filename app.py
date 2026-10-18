@@ -16,6 +16,7 @@ Architecture:
 
 Env:
   HIK_USER, HIK_PASSWORD   Hik-Connect account (required)
+  HIK_PLATFORM             platform: hikconnect | ezviz (default hikconnect)
   CHANNEL                  default NVR channel (0 = first active)
   STREAM                   default stream mode: sub|main|auto (default sub)
   PORT                     API port (default 8000)
@@ -54,7 +55,7 @@ CAM_KEYS_FILE = os.environ.get("CLOUDCAM_CAMKEY_FILE", f"{DATA_DIR}/cam_keys.jso
 os.makedirs(DATA_DIR, exist_ok=True)
 os.environ["CLOUDCAM_TOKEN_FILE"] = TOKEN_FILE
 os.environ["CLOUDCAM_CAMKEY_FILE"] = CAM_KEYS_FILE
-os.environ.setdefault("CLOUDCAM_PLATFORM", "hikconnect")
+os.environ.setdefault("CLOUDCAM_PLATFORM", os.environ.get("HIK_PLATFORM", "hikconnect"))
 
 import cloudcam.decrypt_proxy as dp            # install()s paged VTM + token cache
 from cloudcam.client import CloudClient, MfaRequired
