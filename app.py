@@ -20,6 +20,9 @@ Env:
   CHANNEL                  default NVR channel (0 = first active)
   STREAM                   default stream mode: sub|main|auto (default sub)
   PORT                     API port (default 8000)
+  OFFLINE_RESPONSE         what /snapshot & /frame return for an unreachable
+                           camera: error (default, HTTP 502/504) | nosignal
+                           (200 + "NO SIGNAL" JPEG, code in X-Error headers)
   CLOUDCAM_TOKEN_FILE      cloudcam session token (default /app/data/token.json)
   CLOUDCAM_CAMKEY_FILE     camera keys, JSON {"SERIAL:CH": key} (default /app/data/cam_keys.json)
 """
@@ -96,6 +99,18 @@ HIK_USER = os.environ.get("HIK_USER", "")
 HIK_PASSWORD = os.environ.get("HIK_PASSWORD", "")
 DEFAULT_CHANNEL = int(os.environ.get("CHANNEL", "0"))
 DEFAULT_STREAM = os.environ.get("STREAM", "sub")
+# Как /snapshot и /frame отвечают на недоступную камеру:
+#   error    (по умолчанию, как было до NO SIGNAL-режима) — HTTP-ошибка:
+#            /snapshot 502 «snapshot failed: ...», /frame 502 (воркер не
+#            открыл VTM) / 504 (нет I-кадра / таймаут).
+#   nosignal — 200 + валидный JPEG «NO SIGNAL / камера оффлайн» со строкой
+#            «error <код> — причина» (как плитка /preview); код и причина
+#            дублируются в заголовках X-Error / X-Error-Reason.
+OFFLINE_RESPONSE = os.environ.get("OFFLINE_RESPONSE", "error").strip().lower()
+if OFFLINE_RESPONSE not in ("error", "nosignal"):
+    log.warning("OFFLINE_RESPONSE=%r неизвестно → дефолт 'error'",
+                OFFLINE_RESPONSE)
+    OFFLINE_RESPONSE = "error"
 WORKER_PORT_BASE = int(os.environ.get("WORKER_PORT_BASE", "18100"))
 _TOKEN_MAX_AGE = 1200.0      # refresh well before pyezvizapi 1500s limit
 _CAM_LIST_TTL = 600.0
@@ -745,9 +760,9 @@ def frame(channel: int = Query(DEFAULT_CHANNEL),
     out = Path(tempfile.mktemp(prefix="frame_", suffix=".jpg"))
     # Сбой VTM-облака (502 воркера) или обрыв потока до первого I-кадра —
     # частый случай: повторяем «открыть + дождаться I-кадра» пару раз.
-    # Камера не отвечает (502) или не отдаёт кадры (504) → вместо сырой
-    # HTTP-ошибки возвращаем JPEG «NO SIGNAL» с кодом ошибки и причиной
-    # (см. _offline_jpeg_response), чтобы <img>/дашборд рендерил кадр.
+    # Итог при недоступной камере зависит от OFFLINE_RESPONSE:
+    #   error (дефолт, как раньше) — HTTP 502/504;
+    #   nosignal — 200 + JPEG «NO SIGNAL» с кодом ошибки (см. _offline_jpeg_response).
     fail = None
     jpeg = None
     try:
@@ -816,8 +831,11 @@ def frame(channel: int = Query(DEFAULT_CHANNEL),
     if jpeg is None:
         if fail is None:
             fail = HTTPException(504, "no keyframe (I-frame) in stream window")
-        return _offline_jpeg_response(fail.status_code, fail.detail, W, H,
-                                       label=f"CH {ch:02d}")
+        if OFFLINE_RESPONSE == "nosignal":
+            return _offline_jpeg_response(fail.status_code, fail.detail, W, H,
+                                           label=f"CH {ch:02d}")
+        # Дефолт (как до NO SIGNAL-режима): HTTP-ошибка с причиной
+        raise fail
     log.info("frame %s ch=%d %s -> %d bytes", s, ch, stream, len(jpeg))
     return Response(jpeg, media_type="image/jpeg")
 
@@ -891,14 +909,17 @@ def snapshot(channel: int = Query(DEFAULT_CHANNEL)):
     except HTTPException:
         raise
     except Exception as e:  # noqa: BLE001
-        # Камера/облако не отвечает (2009 设备网络异常, 502 релея, таймаут) —
-        # возвращаем валидный JPEG «NO SIGNAL» с кодом ошибки (как /preview),
-        # чтобы <img>/дашборд рендерил кадр; для API-клиентов код — в
-        # X-Error / X-Error-Reason (статус 200, X-Camera-Status=no-signal).
-        code = getattr(e, "status_code", None)
-        if code not in (400, 401, 403, 404, 405, 409, 422, 429, 500, 501, 502, 503, 504):
-            code = 502
-        return _offline_jpeg_response(code, e, 352, 288, label=f"CH {channel:02d}")
+        if OFFLINE_RESPONSE == "nosignal":
+            # Камера/облако не отвечает (2009 设备网络异常, 502 релея, таймаут) —
+            # возвращаем валидный JPEG «NO SIGNAL» с кодом ошибки (как /preview),
+            # чтобы <img>/дашборд рендерил кадр; для API-клиентов код — в
+            # X-Error / X-Error-Reason (статус 200, X-Camera-Status=no-signal).
+            code = getattr(e, "status_code", None)
+            if code not in (400, 401, 403, 404, 405, 409, 422, 429, 500, 501, 502, 503, 504):
+                code = 502
+            return _offline_jpeg_response(code, e, 352, 288, label=f"CH {channel:02d}")
+        # Дефолт (как до NO SIGNAL-режима): честная HTTP-ошибка
+        raise HTTPException(502, f"snapshot failed: {e}") from e
 
 
 # ---------------- preview grid (все камеры одной картинкой) ----------------

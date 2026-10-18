@@ -77,6 +77,13 @@ services:
       # Часовой пояс контейнера (datetime/timezone, время в шапке /preview, логи):
       # tzdata в образе есть, TZ=Europe/Minsk берётся из .env
       - TZ=${TZ:-UTC}
+      # Как /snapshot и /frame отвечают на недоступную (оффлайн) камеру:
+      #   error (по умолчанию, как раньше) — HTTP 502 «snapshot failed: ...»
+      #     / 502 воркера / 504 «no keyframe ...»;
+      #   nosignal — 200 + JPEG «NO SIGNAL / камера оффлайн» со строкой
+      #     «error <код> — причина» (как плитка /preview), код и причина
+      #     дублируются в заголовках X-Error / X-Error-Reason.
+      - OFFLINE_RESPONSE=${OFFLINE_RESPONSE:-error}
     volumes:
       - data:/app/data    # token.json + cam_keys.json переживают рестарт
     healthcheck:
