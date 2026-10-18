@@ -1123,6 +1123,25 @@ def _offline_jpeg_response(code: int, reason, width: int, height: int,
                     headers=headers)
 
 
+def _preview_bottom_label(canvas, x0, y0, PW, PH, LABEL_H, font, label):
+    """Подпись канала НАД кадром (а не полосой под ним): по нижнему краю
+    — плавный тёмный градиент (высота ~1.7× строки, fade от прозрачности к
+    почти непрозрачному), поверх — текст. Полоска-подпись больше не занимает
+    отдельную строку в раскладке, сетка стала короче по вертикали."""
+    band = max(LABEL_H, int(LABEL_H * 1.7))
+    ytop = y0 + PH - band
+    ov = Image.new("RGBA", (PW, band), (0, 0, 0, 0))
+    od = ImageDraw.Draw(ov)
+    for yy in range(band):
+        a = int(190 * ((yy + 1) / band) ** 1.6)   # 0 → ~190 к нижнему краю
+        od.line((0, yy, PW, yy), fill=(10, 10, 14, a))
+    canvas.paste(ov, (x0, ytop), ov)
+    d = ImageDraw.Draw(canvas)
+    d.text((x0 + 6, y0 + PH - LABEL_H // 2),
+           _preview_fit(d, label, font, PW - 12),
+           font=font, fill=(235, 235, 240), anchor="lm")
+
+
 @app.get("/preview")
 def preview(cell: int = Query(320, ge=120, le=640),
             workers: int = Query(8, ge=1, le=16),
@@ -1143,7 +1162,7 @@ def preview(cell: int = Query(320, ge=120, le=640),
 
     PW = cell
     PH = max(90, int(PW * 3 / 4))       # 4:3, как у облачного снапшота
-    LABEL_H = max(20, int(PW * 0.09))
+    LABEL_H = max(20, int(PW * 0.09))   # высота строки подписи (она на кадре)
     HEAD_H = max(28, int(PW * 0.12))
 
     font = _preview_font(max(13, int(PW * 0.06)))
@@ -1194,7 +1213,7 @@ def preview(cell: int = Query(320, ge=120, le=640),
     cols = _preview_pick_cols(n)
     rows = (n + cols - 1) // cols
     CW = cols * PW
-    CH = HEAD_H + rows * (PH + LABEL_H)
+    CH = HEAD_H + rows * PH   # подпись теперь НА кадре — отдельной строки нет
 
     canvas = Image.new("RGB", (CW, CH), (8, 8, 10))
     d = ImageDraw.Draw(canvas)
@@ -1207,16 +1226,14 @@ def preview(cell: int = Query(320, ge=120, le=640),
     by_ch = {c.channel_no: c for c in cams}
     for i, ch in enumerate(sorted(by_ch)):
         r, col = divmod(i, cols)
-        x0, y0 = col * PW, HEAD_H + r * (PH + LABEL_H)
+        x0, y0 = col * PW, HEAD_H + r * PH
         cam = by_ch[ch]
         canvas.paste(_preview_tile(font, big, sm, PW, PH,
                                    results.get(ch), ch * 7919), (x0, y0))
         d.rectangle((x0, y0, x0 + PW, y0 + PH), outline=(60, 60, 68), width=1)
-        label = f"CH {ch:02d}  {getattr(cam, 'name', '')}"
-        d.rectangle((x0, y0 + PH, x0 + PW, y0 + PH + LABEL_H), fill=(16, 16, 20))
-        d.text((x0 + 6, y0 + PH + LABEL_H // 2),
-               _preview_fit(d, label, font, PW - 12),
-               font=font, fill=(225, 225, 230), anchor="lm")
+        # подпись поверх нижнего края кадра (градиентная тень)
+        _preview_bottom_label(canvas, x0, y0, PW, PH, LABEL_H, font,
+                              f"CH {ch:02d}  {getattr(cam, 'name', '')}")
 
     buf = io.BytesIO()
     canvas.save(buf, "JPEG", quality=quality)
