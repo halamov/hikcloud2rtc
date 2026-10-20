@@ -15,9 +15,8 @@ VLC/ffplay.
 
 ## Go-порт: hikcloud2gortc
 
-[hikcloud2gortc](https://github.com/halamov/hikcloud2gortc) (также
-[Forgejo Home/hikcloud2gortc](http://home-nuc2.hals.home:3000/Home/hikcloud2gortc))
-— полный порт этого проекта на Go: тот же HTTP API (`/stream.ts`, `/frame`,
+[hikcloud2gortc](https://github.com/halamov/hikcloud2gortc) — полный порт
+этого проекта на Go: тот же HTTP API (`/stream.ts`, `/frame`,
 `/snapshot`, `/preview`, `/health`, `/prime`, `/workers`), VTM, AES-128 по
 NAL (HEVC/H.264), PacedWriter, reaper, NO SIGNAL-плитки, та же сетка
 `/preview`. Гоняется на порту `8001` (этот проект остаётся на `8000`),
