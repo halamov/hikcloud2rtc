@@ -18,7 +18,7 @@ Hik-Connect NVR → HTTP-сервис видео-потока и снапшот�
 | `eb3a8c5` | Документация: endpoint `/workers` + WORKER_MODE в README |
 | `04a5d85` | snapshot: re-login + 1 retry при 401 (токен hikcloudstream истёк; клиент жил «один раз на аптайм») |
 | `1f0431e` | Логи: `LOG_DIR` (volume) + RotatingFileHandler app.log (5×5 МБ), воркер-логи в volume (были в /tmp — сгорали при деплое), docker json-file лимит, эндпоинт `/logs` (хвост app.log / воркер-лога без доступа к хосту) |
-| `2645e5a` | compose: json-file `10m × 1` — единый стандарт логов по всем хостам Dockhand (pn40/vps1/nuc2/vps2, 32/32 контейнера) |
+| `2645e5a` | compose: json-file `10m × 1` — единый стандарт логов по всем хостам домашней сети (4 хоста, 32/32 контейнера) |
 | `a769a06` | snapshot: обрезка лишнего байта после EOI (hikcloudstream дописывает 0x00 после FFD9); презентация: слайд 16 — долгие тесты 4 комбинаций |
 | `5b73306` | env: упразднены `TOKEN_FILE`/`CAM_KEYS_FILE` — единый набор `CLOUDCAM_TOKEN_FILE`/`CLOUDCAM_CAMKEY_FILE` (их читают и cloudcam, и app) |
 | `d409090` | compose: явный `hostname: hikcloud2rtc` + `network_mode: bridge` |
@@ -60,5 +60,5 @@ Hik-Connect NVR → HTTP-сервис видео-потока и снапшот�
 - **Утечка клиентов:** при обрыве клиента ffmpeg-пайплайны и VTM-сессии собирались idle-reaper'ом.
 
 ## Деплой
-- Живёт на `<host>` (env 4, Dockhand) как git-стек с GitHub `halamov/hikcloud2rtc`, деплой через Dockhand API.
+- Живёт на `<host>` как git-стек с GitHub `halamov/hikcloud2rtc`, деплой через git + Docker Compose.
 - Тестовый хост (alias `hik`) — `/opt/hikcloud2rtc`, `docker compose up -d --build`; использовался для долгих тестов 18.10 (боевой режим на нём: idle + pace=0, как в проде).

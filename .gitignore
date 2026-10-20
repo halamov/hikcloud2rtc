@@ -3,5 +3,5 @@ __pycache__/
 *.pyc
 # локальные варианты compose/env — НЕ в репозитории
 docker-compose.local.yml
-docker-compose.from-forgejo.yml
-.env.from-forgejo.example
+docker-compose.from-*.yml
+.env.from-*.example
