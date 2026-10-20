@@ -13,6 +13,41 @@ VLC/ffplay.
 | hikcloudstream | https://github.com/cristianojmiranda/hikcloudstream | снапшот из облака (`/snapshot`, ~352×288) |
 | pyezvizapi | https://github.com/RenierM26/pyEzvizApi | протокол облака (VTM relay, login/token) — зависимость `cloudcam/decrypt_proxy` |
 
+## Go-порт: hikcloud2gortc
+
+[hikcloud2gortc](https://github.com/halamov/hikcloud2gortc) (также
+[Forgejo Home/hikcloud2gortc](http://home-nuc2.hals.home:3000/Home/hikcloud2gortc))
+— полный порт этого проекта на Go: тот же HTTP API (`/stream.ts`, `/frame`,
+`/snapshot`, `/preview`, `/health`, `/prime`, `/workers`), VTM, AES-128 по
+NAL (HEVC/H.264), PacedWriter, reaper, NO SIGNAL-плитки, та же сетка
+`/preview`. Гоняется на порту `8001` (этот проект остаётся на `8000`),
+поэтому оба сервиса можно ставить рядом и сравнивать.
+
+A/B-замер обоих сервисов на домашнем NUC (cam8, idle-режим, 2026-10-20,
+контейнеры свежепередеплоены, замер из тестовой площадки Hermes-Sandbox):
+
+| Метрика | Этот проект (`:8000`) | Go (`:8001`) |
+|---|---|---|
+| Память: idle / под нагрузкой / после reaper, МБ | 53 / 124 / 75 | 2.6 / 27 / 28 |
+| CPU под нагрузкой (main-стрим 12 с), % | 16.7 | 13.7 |
+| `/frame` холодный (воркер поднят с нуля), с | 8.0 * | 4.25 |
+| `/frame` тёплый, с | 1.3 (последний кадр из буфера) | 3.5 (следующий I-кадр, GOP) |
+| `/snapshot`, с | 1.9 | 1.6 |
+| `/stream.ts` sub, первый байт, с | 1.9 | 0.8 |
+| `/stream.ts` main, первый байт, с | 0.46 | 0.47 |
+| `/stream.ts` main 12 с, байты | 4 014 176 | 3 247 136 |
+| Reaper (воркеры → 0), 100 с | да | да |
+| Образ Docker, МБ | 633 | 548 |
+
+\* холодный `/frame` Python включает логин в Hik-Connect (контейнер только
+поднят); Go idle 2.6 МБ — свежий контейнер до первого воркера.
+
+Вывод: Go-порт ест в 3–5 раз меньше памяти, холодный `/frame` вдвое
+быстрее, стримы паритет. В тёплом `/frame` Python быстрее (отдаёт
+последний кадр из буфера), Go ждёт ключевой кадр — но отдаёт честный
+FullHD I-кадр. RTSP-агрегация (go2rtc) при переезде теряется — при
+надобности поднимается отдельным контейнером (см. ниже).
+
 ## Запуск
 
 ```bash
